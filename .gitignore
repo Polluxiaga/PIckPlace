@@ -1,0 +1,57 @@
+# Workspace-local tooling
+.codex
+.codex/
+
+# Editor / OS
+**/.vscode/
+**/.idea/
+**/.DS_Store
+
+# Python environments and caches
+**/.venv/
+**/venv/
+**/env/
+**/ENV/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.pyre/
+**/.pytype/
+**/.ruff_cache/
+**/.hypothesis/
+**/.cache/
+**/*.py[cod]
+**/*.so
+
+# Build / coverage
+**/build/
+**/dist/
+**/*.egg-info/
+**/.coverage
+**/.coverage.*
+**/htmlcov/
+
+# Local secrets
+**/.env
+**/.env.*
+openpi/.wandb.env
+
+# Training / runtime artifacts
+openpi/checkpoints/
+openpi/wandb/
+openpi/vis_results/
+openpi/policy_records/
+openpi/data/
+**/*.log
+
+# Notebook scratch
+**/.ipynb_checkpoints/
+
+# Temporary files
+**/*.tmp
+**/*.swp
+**/*~
+tmp/
+
+# Safety: if old nested repos are backed up in-tree, ignore them
+**/.git.backup/

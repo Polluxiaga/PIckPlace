@@ -1,0 +1,51 @@
+# Local secrets and environment
+.env
+.env.*
+.wandb.env
+.venv/
+env/
+venv/
+ENV/
+.python-version
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Python caches and build outputs
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+.cache/
+.hypothesis/
+build/
+dist/
+*.egg-info/
+htmlcov/
+.coverage
+.coverage.*
+
+# Local runtime artifacts
+checkpoints/
+wandb/
+data/
+vis_results/
+policy_records/
+*.log
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+
+# Temporary files
+tmp/
+*.tmp
+*.swp
+*~
+
+# Keep small project assets such as qbin edges and norm stats under assets/
