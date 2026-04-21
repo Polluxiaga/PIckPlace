@@ -34,14 +34,16 @@
 # Local secrets
 **/.env
 **/.env.*
-openpi/.wandb.env
+openpi_pickplace/.wandb.env
+openpi_pickplace/wandb/.wandb.env
 
 # Training / runtime artifacts
-openpi/checkpoints/
-openpi/wandb/
-openpi/vis_results/
-openpi/policy_records/
-openpi/data/
+wandb/
+openpi_pickplace/checkpoints/
+openpi_pickplace/wandb/
+openpi_pickplace/vis_results/
+openpi_pickplace/policy_records/
+openpi_pickplace/data/
 **/*.log
 
 # Notebook scratch
