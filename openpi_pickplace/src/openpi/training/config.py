@@ -646,6 +646,34 @@ def _pickplace_all_qbin64_config(name: str) -> TrainConfig:
     )
 
 
+def _pickplace_all_uniform_config(name: str) -> TrainConfig:
+    return TrainConfig(
+        name=name,
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=18,
+            action_horizon=1,
+            max_token_len=512,
+            paligemma_variant="gemma_2b_lora",
+            fast_model_tokenizer=_tokenizer.UniformBinningPickPlaceTokenizer,
+            fast_model_tokenizer_kwargs={
+                "pick_dim": 9,
+                "place_dim": 9,
+                "n_bins": 64,
+            },
+        ),
+        data=LeRobotRLBenchPickPlaceDataConfig(
+            repo_id="minyangli/pick_place_all",
+            assets=AssetsConfig(assets_dir="assets/pickplace_all_qbin64", asset_id="pick_place_all"),
+            num_ctx_frames=1,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
+        ema_decay=None,
+    )
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -716,36 +744,6 @@ _CONFIGS = [
             ),
         ),
     ),
-######## TODO ##################################################
-    # Single-step pick + place (9+9 DOF) with uniform binning tokenizer — train/finetune before inference.
-    TrainConfig(
-        name="pi0_fast_pickplace_uniform",
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=18,
-            action_horizon=1,
-            max_token_len=384,
-            fast_model_tokenizer=_tokenizer.UniformBinningPickPlaceTokenizer,
-            fast_model_tokenizer_kwargs={
-                "pick_dim": 9,
-                "place_dim": 9,
-                "n_bins": 256,
-            },
-        ),
-        data=SimpleDataConfig(
-            assets=AssetsConfig(asset_id="droid"),
-            data_transforms=lambda model: _transforms.Group(
-                inputs=[droid_policy.DroidInputs(model_type=ModelType.PI0_FAST)],
-                outputs=[
-                    droid_policy.DroidOutputsPickPlace(total_dof=18),
-                    _transforms.SplitPickPlaceActions(pick_dim=9, place_dim=9),
-                ],
-            ),
-            base_config=DataConfig(
-                prompt_from_task=True,
-            ),
-        ),
-    ),
-    # ###### TODO ##################################################
     TrainConfig(
         name="pi05_droid",
         model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
@@ -861,267 +859,10 @@ _CONFIGS = [
         ema_decay=None,
     ),
     #########################################################################################
-    # RLBench pick+place (LeRobot export from scripts/data/rlbench/convert_rlbench_to_lerobot.py).
+    # Current RLBench pick+place configs.
     #########################################################################################
-    TrainConfig(
-        name="pi0_fast_rlbench_pickplace",
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=18,
-            action_horizon=1,
-            max_token_len=512,
-            fast_model_tokenizer=_tokenizer.UniformBinningPickPlaceTokenizer,
-            fast_model_tokenizer_kwargs={
-                "pick_dim": 9,
-                "place_dim": 9,
-                "n_bins": 256,
-            },
-        ),
-        data=LeRobotRLBenchPickPlaceDataConfig(
-            repo_id="minyangli/place_wine_rlbench_v1",
-            assets=AssetsConfig(asset_id="place_wine_v1"),
-            num_ctx_frames=15,
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi0_fast_rlbench_pickplace_lora",
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=18,
-            action_horizon=1,
-            max_token_len=512,
-            paligemma_variant="gemma_2b_lora",
-            fast_model_tokenizer=_tokenizer.UniformBinningPickPlaceTokenizer,
-            fast_model_tokenizer_kwargs={
-                "pick_dim": 9,
-                "place_dim": 9,
-                "n_bins": 256,
-            },
-        ),
-        data=LeRobotRLBenchPickPlaceDataConfig(
-            repo_id="minyangli/place_wine_rlbench_v1",
-            assets=AssetsConfig(asset_id="place_wine_v1"),
-            num_ctx_frames=15,
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-        freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
-        ema_decay=None,
-    ),
-    # Same as above but single image: convert with --random-single-before-pick; set repo_id to your new dataset.
-    TrainConfig(
-        name="pi0_fast_rlbench_pickplace_rand1",
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=18,
-            action_horizon=1,
-            max_token_len=512,
-            fast_model_tokenizer=_tokenizer.UniformBinningPickPlaceTokenizer,
-            fast_model_tokenizer_kwargs={
-                "pick_dim": 9,
-                "place_dim": 9,
-                "n_bins": 256,
-            },
-        ),
-        data=LeRobotRLBenchPickPlaceDataConfig(
-            repo_id="minyangli/place_wine_rlbench_v2",
-            assets=AssetsConfig(asset_id="place_wine_v2"),
-            num_ctx_frames=1,
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
-        name="pi0_fast_rlbench_pickplace_rand1_lora_cam",
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=18,
-            action_horizon=1,
-            max_token_len=512,
-            paligemma_variant="gemma_2b_lora",
-            fast_model_tokenizer=_tokenizer.UniformBinningPickPlaceTokenizer,
-            fast_model_tokenizer_kwargs={
-                "pick_dim": 9,
-                "place_dim": 9,
-                "n_bins": 256,
-            },
-        ),
-        data=LeRobotRLBenchPickPlaceDataConfig(
-            repo_id="minyangli/rlbench_place_wine_front_cam",
-            assets=AssetsConfig(asset_id="front_cam"),
-            num_ctx_frames=1,
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-        freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
-        ema_decay=None,
-    ),
-    # TrainConfig(
-    #     name="pi0_fast_rlbench_pickplace_rand1_lora_cam_qbin128",
-    #     model=pi0_fast.Pi0FASTConfig(
-    #         action_dim=18,
-    #         action_horizon=1,
-    #         max_token_len=512,
-    #         paligemma_variant="gemma_2b_lora",
-    #         fast_model_tokenizer=_tokenizer.QuantileBinningPickPlaceTokenizer,
-    #         fast_model_tokenizer_kwargs={
-    #             "pick_dim": 9,
-    #             "place_dim": 9,
-    #             "n_bins": 128,
-    #             "bin_edges_path": "assets/pi0_fast_rlbench_pickplace_rand1_lora_cam_qbin128/front_cam/bin_edges.npy",
-    #         },
-    #     ),
-    #     data=LeRobotRLBenchPickPlaceDataConfig(
-    #         repo_id="minyangli/rlbench_place_wine_front_cam",
-    #         assets=AssetsConfig(asset_id="front_cam"),
-    #         num_ctx_frames=1,
-    #         base_config=DataConfig(prompt_from_task=True),
-    #     ),
-    #     weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-    #     num_train_steps=30_000,
-    #     freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
-    #     ema_decay=None,
-    # ),
-    TrainConfig(
-        name="pi0_fast_rlbench_pickplace_rand1_lora_cam_qbin64",
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=18,
-            action_horizon=1,
-            max_token_len=512,
-            paligemma_variant="gemma_2b_lora",
-            fast_model_tokenizer=_tokenizer.QuantileBinningPickPlaceTokenizer,
-            fast_model_tokenizer_kwargs={
-                "pick_dim": 9,
-                "place_dim": 9,
-                "n_bins": 64,
-                "bin_edges_path": "assets/pi0_fast_rlbench_pickplace_rand1_lora_cam_qbin64/front_cam/bin_edges.npy",
-            },
-        ),
-        data=LeRobotRLBenchPickPlaceDataConfig(
-            repo_id="minyangli/rlbench_place_wine_front_cam",
-            assets=AssetsConfig(asset_id="front_cam"),
-            num_ctx_frames=1,
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-        freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
-        ema_decay=None,
-    ),
-    # TrainConfig(
-    # name="pi0_fast_rlbench_pickplace_rand1_lora_cam_qbin256",
-    # model=pi0_fast.Pi0FASTConfig(
-    #     action_dim=18,
-    #     action_horizon=1,
-    #     max_token_len=512,
-    #     paligemma_variant="gemma_2b_lora",
-    #     fast_model_tokenizer=_tokenizer.QuantileBinningPickPlaceTokenizer,
-    #     fast_model_tokenizer_kwargs={
-    #         "pick_dim": 9,
-    #         "place_dim": 9,
-    #         "n_bins": 256,
-    #         "bin_edges_path": "assets/pi0_fast_rlbench_pickplace_rand1_lora_cam_qbin256/front_cam/bin_edges.npy",
-    #     },
-    # ),
-    # data=LeRobotRLBenchPickPlaceDataConfig(
-    #     repo_id="minyangli/rlbench_place_wine_front_cam",
-    #     assets=AssetsConfig(asset_id="front_cam"),
-    #     num_ctx_frames=1,
-    #     base_config=DataConfig(prompt_from_task=True),
-    # ),
-    # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-    # num_train_steps=30_000,
-    # freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
-    # ema_decay=None,
-    # ),
-    TrainConfig(
-        name="pi0_fast_rlbench_pickplace_rand1_lora_cam_qbin64_wineshape",
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=18,
-            action_horizon=1,
-            max_token_len=512,
-            paligemma_variant="gemma_2b_lora",
-            fast_model_tokenizer=_tokenizer.QuantileBinningPickPlaceTokenizer,
-            fast_model_tokenizer_kwargs={
-                "pick_dim": 9,
-                "place_dim": 9,
-                "n_bins": 64,
-                "bin_edges_path": "assets/pi0_fast_rlbench_pickplace_rand1_lora_cam_qbin64_wineshape/wine_shape/bin_edges.npy",
-            },
-        ),
-        data=LeRobotRLBenchPickPlaceDataConfig(
-            repo_id="minyangli/place_wine_plus_shape",
-            assets=AssetsConfig(asset_id="wine_shape"),
-            num_ctx_frames=1,
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-        freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
-        ema_decay=None,
-    ),
-    TrainConfig(
-        name="pi0_fast_rlbench_pickplace_rand1_lora_cam_qbin64_wineshapecup",
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=18,
-            action_horizon=1,
-            max_token_len=512,
-            paligemma_variant="gemma_2b_lora",
-            fast_model_tokenizer=_tokenizer.QuantileBinningPickPlaceTokenizer,
-            fast_model_tokenizer_kwargs={
-                "pick_dim": 9,
-                "place_dim": 9,
-                "n_bins": 64,
-                "bin_edges_path": (
-                    "assets/pi0_fast_rlbench_pickplace_rand1_lora_cam_qbin64_wineshapecup/"
-                    "wine_shape_cup/bin_edges.npy"
-                ),
-            },
-        ),
-        data=LeRobotRLBenchPickPlaceDataConfig(
-            repo_id="minyangli/place_wine_shape_cup",
-            assets=AssetsConfig(asset_id="wine_shape_cup"),
-            num_ctx_frames=1,
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-        freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
-        ema_decay=None,
-    ),
-    TrainConfig(
-        name="pi0_fast_rlbench_pickplace_rand1_lora_cam_vq128_wineshapecup",
-        model=pi0_fast.Pi0FASTConfig(
-            action_dim=18,
-            action_horizon=1,
-            max_token_len=512,
-            paligemma_variant="gemma_2b_lora",
-            fast_model_tokenizer=_tokenizer.VQActionTokenizer,
-            fast_model_tokenizer_kwargs={
-                "pick_dim": 9,
-                "place_dim": 9,
-                "codebook_size": 128,
-                "codebook_path": (
-                    "assets/pi0_fast_rlbench_pickplace_rand1_lora_cam_vq128_wineshapecup/"
-                    "wine_shape_cup/codebook.npy"
-                ),
-            },
-        ),
-        data=LeRobotRLBenchPickPlaceDataConfig(
-            repo_id="minyangli/place_wine_shape_cup",
-            assets=AssetsConfig(asset_id="wine_shape_cup"),
-            num_ctx_frames=1,
-            base_config=DataConfig(prompt_from_task=True),
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
-        num_train_steps=30_000,
-        freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
-        ema_decay=None,
-    ),
-    _pickplace_all_qbin64_config("pi0_fast_rlbench_pickplace_rand1_lora_cam_qbin64_all"),
     _pickplace_all_qbin64_config("pickplace_all_qbin64"),
+    _pickplace_all_uniform_config("pickplace_all_uniform"),
 
     #####################################################################################################
     TrainConfig(

@@ -28,8 +28,9 @@ Usage::
     export HF_LEROBOT_HOME=/path/to/parent/of/repo
 
     cd openpi_pickplace && uv run scripts/visualization/inference_vis_rlbench.py \\
+      --config-name pickplace_all_qbin64 \\
       --checkpoint-dir /path/to/checkpoint/5000 \\
-      --eval-repo-id minyangli/place_wine_rlbench_v2_eval \\
+      --eval-repo-id minyangli/pick_place_all \\
       --sample-index 0 \\
       --vis-output /tmp/vis.png \\
       --vis-compare-gt-pred   # 可选：同图 GT + Pred（夹爪与 TCP 分色）
@@ -1124,7 +1125,7 @@ def _summarize_match_rate(
 
 def main(
     *,
-    config_name: str = "pi0_fast_rlbench_pickplace_rand1_lora_cam",
+    config_name: str = "pickplace_all_qbin64",
     checkpoint_dir: pathlib.Path,
     eval_repo_id: str,
     sample_index: int = 0,

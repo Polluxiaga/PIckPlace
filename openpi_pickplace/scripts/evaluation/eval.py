@@ -60,6 +60,145 @@ def _write_local_sweep_metrics(
         writer.writerow(payload)
 
 
+def _loss_token_labels(action_dim: int, action_horizon: int) -> list[str]:
+    labels: list[str] = []
+    n_action_tokens = action_dim * action_horizon
+    for i in range(n_action_tokens):
+        dim = i % action_dim
+        horizon = i // action_dim
+        if action_horizon == 1 and action_dim == 18:
+            prefix = "pick" if dim < 9 else "place"
+            labels.append(f"{prefix}_{dim % 9:02d}")
+        elif action_horizon == 1:
+            labels.append(f"action_{dim:02d}")
+        else:
+            labels.append(f"h{horizon:02d}_action_{dim:02d}")
+    labels.extend(["pipe", "eos"])
+    return labels
+
+
+def _token_ce_metrics(prefix: str, ce_by_loss_pos: np.ndarray, *, action_dim: int, action_horizon: int) -> dict[str, float]:
+    values = np.asarray(ce_by_loss_pos, dtype=np.float64)
+    labels = _loss_token_labels(action_dim, action_horizon)
+    base = f"{prefix}/token_ce" if prefix else "token_ce"
+    ce_base = f"{prefix}/ce" if prefix else "ce"
+    token_mean_base = f"{prefix}/token_ce_mean" if prefix else "token_ce_mean"
+    n_action_tokens = min(action_dim * action_horizon, len(values))
+    metrics = {
+        f"{base}/{label}": float(values[i])
+        for i, label in enumerate(labels[:n_action_tokens])
+    }
+    if n_action_tokens:
+        metrics[f"{base}/action_mean"] = float(np.mean(values[:n_action_tokens]))
+    if action_horizon == 1 and action_dim == 18 and len(values) >= 18:
+        pick_mean = float(np.mean(values[:9]))
+        place_mean = float(np.mean(values[9:18]))
+        metrics[f"{base}/pick_mean"] = pick_mean
+        metrics[f"{base}/place_mean"] = place_mean
+        metrics[f"{ce_base}/pick"] = pick_mean
+        metrics[f"{ce_base}/place"] = place_mean
+        metrics[f"{token_mean_base}/pick"] = pick_mean
+        metrics[f"{token_mean_base}/place"] = place_mean
+    return metrics
+
+
+def _token_ce_sums_by_loss_position(
+    token_nll: np.ndarray,
+    loss_mask: np.ndarray,
+    *,
+    max_loss_tokens: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    token_nll = np.asarray(token_nll, dtype=np.float64)
+    loss_mask = np.asarray(loss_mask, dtype=bool)
+    loss_pos = np.cumsum(loss_mask.astype(np.int32), axis=-1) - 1
+    valid = loss_mask & (loss_pos >= 0) & (loss_pos < max_loss_tokens)
+    sums = np.zeros(max_loss_tokens, dtype=np.float64)
+    counts = np.zeros(max_loss_tokens, dtype=np.float64)
+    for pos in range(max_loss_tokens):
+        m = valid & (loss_pos == pos)
+        sums[pos] = float(np.sum(token_nll[m]))
+        counts[pos] = float(np.sum(m))
+    return sums, counts
+
+
+def _eval_wandb_payload(payload: dict[str, Any], *, prefix: str, checkpoint_step_key: str) -> dict[str, float]:
+    keep = (
+        f"{prefix}/token_ce_avg",
+        f"{prefix}/action_mse_avg",
+        f"{prefix}/pick_dof_l2",
+        f"{prefix}/place_dof_l2",
+        f"{prefix}/pick_trans_l2",
+        f"{prefix}/place_trans_l2",
+    )
+    out = {checkpoint_step_key: float(payload[checkpoint_step_key])}
+    out.update({key: float(payload[key]) for key in keep if key in payload})
+    return out
+
+
+def _token_ce_values_from_metrics(metrics: dict[str, Any]) -> dict[str, float]:
+    return {
+        label: float(metrics[f"token_ce/{label}"])
+        for label in _loss_token_labels(18, 1)[:18]
+        if f"token_ce/{label}" in metrics
+    }
+
+
+def _save_token_ce_chart(
+    vis_dir: epath.Path,
+    *,
+    step: int,
+    history: dict[int, dict[str, float]],
+) -> epath.Path | None:
+    if not history:
+        return None
+    steps = sorted(history)
+    if not any(history[s] for s in steps):
+        return None
+
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    vis_dir.mkdir(parents=True, exist_ok=True)
+    out_path = vis_dir / f"step_{step:06d}_token_ce.png"
+    colors = plt.get_cmap("tab10").colors[:9]
+
+    fig, ax = plt.subplots(figsize=(10.5, 5.8), dpi=160)
+    for dof_idx in range(9):
+        color = colors[dof_idx]
+        pick_label = f"pick_{dof_idx:02d}"
+        place_label = f"place_{dof_idx:02d}"
+        pick_y = [history[s].get(pick_label, np.nan) for s in steps]
+        place_y = [history[s].get(place_label, np.nan) for s in steps]
+        ax.plot(steps, pick_y, color=color, linestyle="-", marker="o", linewidth=1.8, markersize=3.5)
+        ax.plot(steps, place_y, color=color, linestyle="--", marker="s", linewidth=1.8, markersize=3.5)
+
+    from matplotlib.lines import Line2D
+
+    dof_handles = [
+        Line2D([0], [0], color=colors[i], lw=2, label=f"dof_{i:02d}")
+        for i in range(9)
+    ]
+    stage_handles = [
+        Line2D([0], [0], color="black", lw=2, linestyle="-", label="pick"),
+        Line2D([0], [0], color="black", lw=2, linestyle="--", label="place"),
+    ]
+    legend1 = ax.legend(handles=dof_handles, title="dimension", ncol=3, loc="upper left", fontsize=8)
+    ax.add_artist(legend1)
+    ax.legend(handles=stage_handles, title="stage", loc="upper right", fontsize=8)
+    ax.set_title("Per-token CE by checkpoint")
+    ax.set_xlabel("checkpoint step")
+    ax.set_ylabel("cross entropy")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(str(out_path))
+    plt.close(fig)
+    return out_path
+
+
 def _fast_tokenizer_from_config(
     model_config: _model.BaseModelConfig,
     *,
@@ -402,10 +541,15 @@ def evaluate_checkpoint(
     total_examples = 0
     total_ce_sum = 0.0
     total_action_mse_sum = 0.0
+    total_pick_action_mse_sum = 0.0
+    total_place_action_mse_sum = 0.0
     total_pick_dof_l2_sum = 0.0
     total_place_dof_l2_sum = 0.0
     total_pick_trans_l2_sum = 0.0
     total_place_trans_l2_sum = 0.0
+    max_loss_tokens = config.model.action_horizon * config.model.action_dim + 2
+    total_token_ce_sums = np.zeros(max_loss_tokens, dtype=np.float64)
+    total_token_ce_counts = np.zeros(max_loss_tokens, dtype=np.float64)
     media: dict[str, Any] = {}
     media_written = False
 
@@ -421,6 +565,13 @@ def evaluate_checkpoint(
         token_nll = np.asarray(jax.device_get(token_nll))
         loss_mask = np.asarray(jax.device_get(loss_mask))
         per_example_ce = np.sum(token_nll * loss_mask, axis=-1) / np.clip(np.sum(loss_mask, axis=-1), 1, None)
+        token_ce_sums, token_ce_counts = _token_ce_sums_by_loss_position(
+            token_nll,
+            loss_mask,
+            max_loss_tokens=max_loss_tokens,
+        )
+        total_token_ce_sums += token_ce_sums
+        total_token_ce_counts += token_ce_counts
 
         batch_inf = _tokenize_collated_batch(batch_pre, tokenize, include_actions=False)
         obs_inf = _model.Observation.from_dict(batch_inf)
@@ -451,27 +602,32 @@ def evaluate_checkpoint(
         pick_trans_err = np.linalg.norm(pred_flat[:, :3] - gt_flat[:, :3], axis=-1)
         place_trans_err = np.linalg.norm(pred_flat[:, 9:12] - gt_flat[:, 9:12], axis=-1)
         action_mse = np.mean((pred_flat - gt_flat) ** 2, axis=-1)
+        pick_action_mse = np.mean((pred_flat[:, :9] - gt_flat[:, :9]) ** 2, axis=-1)
+        place_action_mse = np.mean((pred_flat[:, 9:18] - gt_flat[:, 9:18]) ** 2, axis=-1)
 
         batch_examples = int(pred_flat.shape[0])
         total_examples += batch_examples
         total_ce_sum += float(np.sum(per_example_ce))
         total_action_mse_sum += float(np.sum(action_mse))
+        total_pick_action_mse_sum += float(np.sum(pick_action_mse))
+        total_place_action_mse_sum += float(np.sum(place_action_mse))
         total_pick_dof_l2_sum += float(np.sum(pick_err))
         total_place_dof_l2_sum += float(np.sum(place_err))
         total_pick_trans_l2_sum += float(np.sum(pick_trans_err))
         total_place_trans_l2_sum += float(np.sum(place_trans_err))
 
         if not media_written:
+            checkpoint_step = int(checkpoint_dir.name)
             overlay_grid = _build_overlay_grid(batch_pre, gt_flat, pred_flat)
             _save_overlay_grid(
                 checkpoint_dir / "test_vis",
-                step=checkpoint_dir.name and int(checkpoint_dir.name),
+                step=checkpoint_step,
                 overlay_grid=overlay_grid,
             )
             media = {
                 "test_vis/overlay": wandb.Image(
                     overlay_grid,
-                    caption="GT: green/magenta, Pred: red/cyan",
+                    caption=f"checkpoint_step={checkpoint_step}; GT: green/magenta, Pred: red/cyan",
                 ),
             }
             media_written = True
@@ -479,15 +635,36 @@ def evaluate_checkpoint(
     if total_examples == 0:
         raise ValueError("No evaluation examples were processed.")
 
-    return {
+    token_ce = total_token_ce_sums / np.clip(total_token_ce_counts, 1, None)
+    metrics = {
         "mean_cross_entropy": total_ce_sum / total_examples,
         "action_mse": total_action_mse_sum / total_examples,
+        "action_mse_avg": total_action_mse_sum / total_examples,
+        "pick_action_mse": total_pick_action_mse_sum / total_examples,
+        "place_action_mse": total_place_action_mse_sum / total_examples,
         "pick_dof_l2": total_pick_dof_l2_sum / total_examples,
         "place_dof_l2": total_place_dof_l2_sum / total_examples,
         "pick_trans_l2": total_pick_trans_l2_sum / total_examples,
         "place_trans_l2": total_place_trans_l2_sum / total_examples,
+        "action_mse/pick": total_pick_action_mse_sum / total_examples,
+        "action_mse/place": total_place_action_mse_sum / total_examples,
+        "dof_l2/pick": total_pick_dof_l2_sum / total_examples,
+        "dof_l2/place": total_place_dof_l2_sum / total_examples,
+        "trans_l2/pick": total_pick_trans_l2_sum / total_examples,
+        "trans_l2/place": total_place_trans_l2_sum / total_examples,
         "num_examples_used": float(total_examples),
-    }, media
+    }
+    metrics.update(
+        _token_ce_metrics(
+            "",
+            token_ce,
+            action_dim=config.model.action_dim,
+            action_horizon=config.model.action_horizon,
+        )
+    )
+    if "token_ce/action_mean" in metrics:
+        metrics["token_ce_avg"] = metrics["token_ce/action_mean"]
+    return metrics, media
 
 
 def run_post_train_eval_sweep(config: _config.TrainConfig) -> None:
@@ -525,6 +702,7 @@ def run_post_train_eval_sweep(config: _config.TrainConfig) -> None:
         steps,
         batch_size,
     )
+    token_ce_history: dict[int, dict[str, float]] = {}
     for step in steps:
         checkpoint_dir = checkpoint_root / str(step)
         logging.info("Evaluating checkpoint %s on %s", checkpoint_dir, eval_repo_id)
@@ -542,12 +720,29 @@ def run_post_train_eval_sweep(config: _config.TrainConfig) -> None:
             **{f"{metric_prefix}/{k}": float(v) for k, v in metrics.items()},
         }
         _write_local_sweep_metrics(metrics_path, latest_metrics_path, csv_path, payload=payload)
-        wandb_payload = {
-            k: v
-            for k, v in payload.items()
-            if k == checkpoint_step_key or (k.startswith(f"{metric_prefix}/") and not k.endswith("/num_examples_used"))
-        }
-        wandb.log({**wandb_payload, **media})
+        token_ce_history[step] = _token_ce_values_from_metrics(metrics)
+        token_ce_chart = _save_token_ce_chart(
+            checkpoint_dir / "test_vis",
+            step=step,
+            history=token_ce_history,
+        )
+        if token_ce_chart is not None:
+            media["test_vis/token_ce"] = wandb.Image(
+                str(token_ce_chart),
+                caption=f"checkpoint_step={step}; pick=solid, place=dashed",
+            )
+        wandb_payload = _eval_wandb_payload(
+            payload,
+            prefix=metric_prefix,
+            checkpoint_step_key=checkpoint_step_key,
+        )
+        wandb.log(
+            {
+                **wandb_payload,
+                **media,
+            },
+            step=step,
+        )
         logging.info(
             "Eval step %d: ce=%.4f action_mse=%.4f pick_trans=%.4f place_trans=%.4f",
             step,

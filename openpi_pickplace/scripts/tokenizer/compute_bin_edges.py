@@ -10,8 +10,8 @@ Example:
 .. code-block:: bash
 
     uv run scripts/tokenizer/compute_bin_edges.py \
-      --config-name pi0_fast_rlbench_pickplace_rand1_lora_cam_qbin128 \
-      --n-bins 128
+      --config-name pickplace_all_qbin64 \
+      --n-bins 64
 """
 
 from __future__ import annotations

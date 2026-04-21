@@ -99,6 +99,85 @@ def _write_local_metrics(
     latest_metrics_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+def _loss_token_labels(action_dim: int, action_horizon: int) -> list[str]:
+    labels: list[str] = []
+    n_action_tokens = action_dim * action_horizon
+    for i in range(n_action_tokens):
+        dim = i % action_dim
+        horizon = i // action_dim
+        if action_horizon == 1 and action_dim == 18:
+            prefix = "pick" if dim < 9 else "place"
+            labels.append(f"{prefix}_{dim % 9:02d}")
+        elif action_horizon == 1:
+            labels.append(f"action_{dim:02d}")
+        else:
+            labels.append(f"h{horizon:02d}_action_{dim:02d}")
+    labels.extend(["pipe", "eos"])
+    return labels
+
+
+def _token_ce_metrics(prefix: str, ce_by_loss_pos: np.ndarray, *, action_dim: int, action_horizon: int) -> dict[str, float]:
+    values = np.asarray(ce_by_loss_pos, dtype=np.float64)
+    labels = _loss_token_labels(action_dim, action_horizon)
+    base = f"{prefix}/token_ce" if prefix else "token_ce"
+    ce_base = f"{prefix}/ce" if prefix else "ce"
+    token_mean_base = f"{prefix}/token_ce_mean" if prefix else "token_ce_mean"
+    n_action_tokens = min(action_dim * action_horizon, len(values))
+    metrics = {
+        f"{base}/{label}": float(values[i])
+        for i, label in enumerate(labels[:n_action_tokens])
+    }
+    if n_action_tokens:
+        metrics[f"{base}/action_mean"] = float(np.mean(values[:n_action_tokens]))
+    if action_horizon == 1 and action_dim == 18 and len(values) >= 18:
+        pick_mean = float(np.mean(values[:9]))
+        place_mean = float(np.mean(values[9:18]))
+        metrics[f"{base}/pick_mean"] = pick_mean
+        metrics[f"{base}/place_mean"] = place_mean
+        metrics[f"{ce_base}/pick"] = pick_mean
+        metrics[f"{ce_base}/place"] = place_mean
+        metrics[f"{token_mean_base}/pick"] = pick_mean
+        metrics[f"{token_mean_base}/place"] = place_mean
+    return metrics
+
+
+def _mean_ce_by_loss_position(
+    token_nll: jnp.ndarray,
+    loss_mask: jnp.ndarray,
+    *,
+    max_loss_tokens: int,
+) -> jnp.ndarray:
+    loss_mask = loss_mask.astype(jnp.bool_)
+    loss_pos = jnp.cumsum(loss_mask.astype(jnp.int32), axis=-1) - 1
+    valid = loss_mask & (loss_pos >= 0) & (loss_pos < max_loss_tokens)
+    one_hot = jax.nn.one_hot(
+        jnp.clip(loss_pos, 0, max_loss_tokens - 1),
+        max_loss_tokens,
+        dtype=token_nll.dtype,
+    )
+    valid_f = valid.astype(token_nll.dtype)
+    sums = jnp.sum(one_hot * token_nll[..., None] * valid_f[..., None], axis=(0, 1))
+    counts = jnp.sum(one_hot * valid_f[..., None], axis=(0, 1))
+    return sums / jnp.clip(counts, 1)
+
+
+def _train_wandb_payload(metrics: dict[str, Any]) -> dict[str, float]:
+    keep = ("param_norm", "loss", "grad_norm")
+    return {key: float(metrics[key]) for key in keep if key in metrics}
+
+
+def _probe_wandb_payload(metrics: dict[str, Any]) -> dict[str, float]:
+    keep = (
+        "probe/token_ce_avg",
+        "probe/action_mse_avg",
+        "probe/pick_dof_l2",
+        "probe/place_dof_l2",
+        "probe/pick_trans_l2",
+        "probe/place_trans_l2",
+    )
+    return {key: float(metrics[key]) for key in keep if key in metrics}
+
+
 FRONT_CAMERA_INTRINSICS = np.array(
     [
         [-175.83856040078922, 0.0, 64.0],
@@ -328,6 +407,71 @@ def _save_overlay_grid(
     return overlay_path
 
 
+def _token_ce_values_by_dof(ce_by_loss_pos: np.ndarray) -> dict[str, float]:
+    values = np.asarray(ce_by_loss_pos, dtype=np.float64)
+    labels = _loss_token_labels(18, 1)[:18]
+    return {
+        label: float(values[i])
+        for i, label in enumerate(labels)
+        if i < len(values)
+    }
+
+
+def _save_token_ce_chart(
+    vis_dir: epath.Path,
+    *,
+    step: int,
+    history: dict[int, dict[str, float]],
+) -> epath.Path | None:
+    if not history:
+        return None
+    steps = sorted(history)
+    if not any(history[s] for s in steps):
+        return None
+
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    vis_dir.mkdir(parents=True, exist_ok=True)
+    out_path = vis_dir / f"step_{step:06d}_token_ce.png"
+    colors = plt.get_cmap("tab10").colors[:9]
+
+    fig, ax = plt.subplots(figsize=(10.5, 5.8), dpi=160)
+    for dof_idx in range(9):
+        color = colors[dof_idx]
+        pick_label = f"pick_{dof_idx:02d}"
+        place_label = f"place_{dof_idx:02d}"
+        pick_y = [history[s].get(pick_label, np.nan) for s in steps]
+        place_y = [history[s].get(place_label, np.nan) for s in steps]
+        ax.plot(steps, pick_y, color=color, linestyle="-", marker="o", linewidth=1.8, markersize=3.5)
+        ax.plot(steps, place_y, color=color, linestyle="--", marker="s", linewidth=1.8, markersize=3.5)
+
+    dof_handles = [
+        Line2D([0], [0], color=colors[i], lw=2, label=f"dof_{i:02d}")
+        for i in range(9)
+    ]
+    stage_handles = [
+        Line2D([0], [0], color="black", lw=2, linestyle="-", label="pick"),
+        Line2D([0], [0], color="black", lw=2, linestyle="--", label="place"),
+    ]
+    legend1 = ax.legend(handles=dof_handles, title="dimension", ncol=3, loc="upper left", fontsize=8)
+    ax.add_artist(legend1)
+    ax.legend(handles=stage_handles, title="stage", loc="upper right", fontsize=8)
+    ax.set_title("Probe per-token CE by step")
+    ax.set_xlabel("train step")
+    ax.set_ylabel("cross entropy")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(str(out_path))
+    plt.close(fig)
+    return out_path
+
+
 def _init_probe_context(config: _config.TrainConfig) -> dict[str, Any]:
     data_config = config.data.create(config.assets_dirs, config.model)
     data_config_pre = dataclasses.replace(
@@ -377,8 +521,31 @@ def _evaluate_probe_batch(
     psample_actions,
     *,
     step: int,
+    token_ce_history: dict[int, dict[str, float]] | None = None,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     batch_pre = probe_context["batch"]
+    batch_ce = _tokenize_collated_batch(batch_pre, probe_context["tokenize"], include_actions=True)
+    obs_ce = _model.Observation.from_dict(batch_ce)
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+    ce_rng = jax.random.fold_in(jax.random.key(config.seed), int(step))
+    token_nll, loss_mask = model.compute_loss_per_token(ce_rng, obs_ce, batch_ce["actions"], train=False)
+    token_nll = np.asarray(jax.device_get(token_nll), dtype=np.float64)
+    loss_mask = np.asarray(jax.device_get(loss_mask), dtype=np.float64)
+    per_example_ce = np.sum(token_nll * loss_mask, axis=-1) / np.clip(np.sum(loss_mask, axis=-1), 1, None)
+    ce_by_loss_pos = np.asarray(
+        jax.device_get(
+            _mean_ce_by_loss_position(
+                jnp.asarray(token_nll),
+                jnp.asarray(loss_mask),
+                max_loss_tokens=config.model.action_horizon * config.model.action_dim + 2,
+            )
+        ),
+        dtype=np.float64,
+    )
+    n_action_tokens = min(config.model.action_horizon * config.model.action_dim, len(ce_by_loss_pos))
+    token_ce_avg = float(np.mean(ce_by_loss_pos[:n_action_tokens])) if n_action_tokens else float(np.mean(per_example_ce))
+
     batch_inf = _tokenize_collated_batch(batch_pre, probe_context["tokenize"], include_actions=False)
     obs_inf = _model.Observation.from_dict(batch_inf)
     eval_rng = jax.random.fold_in(jax.random.key(config.seed), int(step))
@@ -410,10 +577,20 @@ def _evaluate_probe_batch(
     pick_trans_err = np.linalg.norm(pred_flat[:, :3] - gt_flat[:, :3], axis=-1)
     place_trans_err = np.linalg.norm(pred_flat[:, 9:12] - gt_flat[:, 9:12], axis=-1)
     action_mse = np.mean((pred_flat - gt_flat) ** 2, axis=-1)
+    pick_action_mse = np.mean((pred_flat[:, :9] - gt_flat[:, :9]) ** 2, axis=-1)
+    place_action_mse = np.mean((pred_flat[:, 9:18] - gt_flat[:, 9:18]) ** 2, axis=-1)
 
     overlay_grid = _build_overlay_grid(batch_pre, gt_flat, pred_flat)
     vis_dir = config.checkpoint_dir / "probe_vis"
     _save_overlay_grid(vis_dir, step=step, overlay_grid=overlay_grid)
+    token_ce_chart = None
+    if token_ce_history is not None:
+        token_ce_history[int(step)] = _token_ce_values_by_dof(ce_by_loss_pos)
+        token_ce_chart = _save_token_ce_chart(
+            vis_dir,
+            step=step,
+            history=token_ce_history,
+        )
     summary_path = vis_dir / f"step_{step:06d}_metrics.json"
 
     metrics = {
@@ -422,7 +599,15 @@ def _evaluate_probe_batch(
         "probe/pick_trans_l2": float(np.mean(pick_trans_err)),
         "probe/place_trans_l2": float(np.mean(place_trans_err)),
         "probe/action_mse": float(np.mean(action_mse)),
-        "probe/sample_count": float(pred_flat.shape[0]),
+        "probe/ce": float(np.mean(per_example_ce)),
+        "probe/token_ce_avg": token_ce_avg,
+        "probe/action_mse_avg": float(np.mean(action_mse)),
+        "probe/dof_l2/pick": float(np.mean(pick_err)),
+        "probe/dof_l2/place": float(np.mean(place_err)),
+        "probe/trans_l2/pick": float(np.mean(pick_trans_err)),
+        "probe/trans_l2/place": float(np.mean(place_trans_err)),
+        "probe/action_mse/pick": float(np.mean(pick_action_mse)),
+        "probe/action_mse/place": float(np.mean(place_action_mse)),
     }
     summary_path.write_text(json.dumps({"step": step, **metrics}, indent=2, sort_keys=True) + "\n")
     media = {
@@ -431,6 +616,11 @@ def _evaluate_probe_batch(
             caption="GT: green/magenta, Pred: red/cyan",
         ),
     }
+    if token_ce_chart is not None:
+        media["probe_vis/token_ce"] = wandb.Image(
+            str(token_ce_chart),
+            caption=f"step={step}; pick=solid, place=dashed",
+        )
     return metrics, media
 
 
@@ -561,6 +751,24 @@ def train_step(
     return new_state, info
 
 
+def token_ce_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> at.Float[at.Array, "l"]:
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+    observation, actions = batch
+    eval_rng = jax.random.fold_in(rng, state.step)
+    token_nll, loss_mask = model.compute_loss_per_token(eval_rng, observation, actions, train=False)
+    return _mean_ce_by_loss_position(
+        token_nll,
+        loss_mask,
+        max_loss_tokens=config.model.action_horizon * config.model.action_dim + 2,
+    )
+
+
 @at.typecheck
 def sample_actions_step(
     rng: at.KeyArrayLike,
@@ -606,6 +814,7 @@ def main(config: _config.TrainConfig):
         shuffle=True,
     )
     probe_context = None
+    probe_token_ce_history: dict[int, dict[str, float]] = {}
     if enable_probe:
         try:
             probe_context = _init_probe_context(config)
@@ -642,9 +851,16 @@ def main(config: _config.TrainConfig):
             probe_context,
             psample_actions,
             step=0,
+            token_ce_history=probe_token_ce_history,
         )
         _write_local_metrics(metrics_path, latest_metrics_path, step=0, metrics=probe_metrics)
-        wandb.log({**probe_metrics, **probe_media}, step=0)
+        wandb.log(
+            {
+                **_probe_wandb_payload(probe_metrics),
+                **probe_media,
+            },
+            step=0,
+        )
 
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
@@ -677,12 +893,20 @@ def main(config: _config.TrainConfig):
                 probe_context,
                 psample_actions,
                 step=step,
+                token_ce_history=probe_token_ce_history,
             )
             numeric_log_payload.update(probe_metrics)
             media_log_payload.update(probe_media)
         if numeric_log_payload:
             _write_local_metrics(metrics_path, latest_metrics_path, step=step, metrics=numeric_log_payload)
-            wandb.log({**numeric_log_payload, **media_log_payload}, step=step)
+            wandb.log(
+                {
+                    **_train_wandb_payload(numeric_log_payload),
+                    **_probe_wandb_payload(numeric_log_payload),
+                    **media_log_payload,
+                },
+                step=step,
+            )
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
