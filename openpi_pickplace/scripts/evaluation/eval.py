@@ -125,8 +125,8 @@ def _eval_wandb_payload(payload: dict[str, Any], *, prefix: str, checkpoint_step
     keep = (
         f"{prefix}/token_ce_avg",
         f"{prefix}/action_mse_avg",
-        f"{prefix}/pick_dof_l2",
-        f"{prefix}/place_dof_l2",
+        f"{prefix}/pick_rot6d_l2",
+        f"{prefix}/place_rot6d_l2",
         f"{prefix}/pick_trans_l2",
         f"{prefix}/place_trans_l2",
     )
@@ -140,6 +140,14 @@ def _token_ce_values_from_metrics(metrics: dict[str, Any]) -> dict[str, float]:
         label: float(metrics[f"token_ce/{label}"])
         for label in _loss_token_labels(18, 1)[:18]
         if f"token_ce/{label}" in metrics
+    }
+
+
+def _token_ce_values_from_payload(payload: dict[str, Any], *, metric_prefix: str) -> dict[str, float]:
+    return {
+        label: float(payload[f"{metric_prefix}/token_ce/{label}"])
+        for label in _loss_token_labels(18, 1)[:18]
+        if f"{metric_prefix}/token_ce/{label}" in payload
     }
 
 
@@ -192,6 +200,7 @@ def _save_token_ce_chart(
     ax.set_title("Per-token CE by checkpoint")
     ax.set_xlabel("checkpoint step")
     ax.set_ylabel("cross entropy")
+    ax.set_ylim(0, 6)
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
     fig.savefig(str(out_path))
@@ -464,10 +473,12 @@ def evaluate_checkpoint(
     eval_repo_id: str,
     batch_size: int,
     seed: int,
+    model: Any | None = None,
+    max_decoding_steps: int | None = None,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     params_path = checkpoint_dir / "params"
     assets_root = checkpoint_dir / "assets"
-    if not params_path.is_dir():
+    if model is None and not params_path.is_dir():
         raise FileNotFoundError(f"Missing params directory: {params_path}")
 
     data_config_train = config.data.create(config.assets_dirs, config.model)
@@ -534,8 +545,10 @@ def evaluate_checkpoint(
         action_dim=config.model.action_dim,
     )
 
-    params = _model.restore_params(params_path, dtype=jnp.bfloat16)
-    model = config.model.load(params)
+    if model is None:
+        params = _model.restore_params(params_path, dtype=jnp.bfloat16)
+        model = config.model.load(params)
+    model.eval()
 
     rng = jax.random.key(seed)
     total_examples = 0
@@ -543,11 +556,13 @@ def evaluate_checkpoint(
     total_action_mse_sum = 0.0
     total_pick_action_mse_sum = 0.0
     total_place_action_mse_sum = 0.0
-    total_pick_dof_l2_sum = 0.0
-    total_place_dof_l2_sum = 0.0
+    total_pick_rot6d_l2_sum = 0.0
+    total_place_rot6d_l2_sum = 0.0
     total_pick_trans_l2_sum = 0.0
     total_place_trans_l2_sum = 0.0
     max_loss_tokens = config.model.action_horizon * config.model.action_dim + 2
+    if max_decoding_steps is None:
+        max_decoding_steps = max_loss_tokens
     total_token_ce_sums = np.zeros(max_loss_tokens, dtype=np.float64)
     total_token_ce_counts = np.zeros(max_loss_tokens, dtype=np.float64)
     media: dict[str, Any] = {}
@@ -576,7 +591,7 @@ def evaluate_checkpoint(
         batch_inf = _tokenize_collated_batch(batch_pre, tokenize, include_actions=False)
         obs_inf = _model.Observation.from_dict(batch_inf)
         rng, sample_rng = jax.random.split(rng)
-        token_ids = model.sample_actions(sample_rng, obs_inf)
+        token_ids = model.sample_actions(sample_rng, obs_inf, max_decoding_steps=max_decoding_steps)
         token_np = np.asarray(jax.device_get(token_ids)).astype(np.int32)
 
         pred_chunks = [extract({"actions": token_np[i]})["actions"] for i in range(token_np.shape[0])]
@@ -597,8 +612,8 @@ def evaluate_checkpoint(
         pred_flat = np.asarray(pred_actions_raw[:, 0, :18], dtype=np.float64)
         gt_flat = np.asarray(gt_actions_raw[:, 0, :18], dtype=np.float64)
 
-        pick_err = np.linalg.norm(pred_flat[:, :9] - gt_flat[:, :9], axis=-1)
-        place_err = np.linalg.norm(pred_flat[:, 9:18] - gt_flat[:, 9:18], axis=-1)
+        pick_rot6d_err = np.linalg.norm(pred_flat[:, 3:9] - gt_flat[:, 3:9], axis=-1)
+        place_rot6d_err = np.linalg.norm(pred_flat[:, 12:18] - gt_flat[:, 12:18], axis=-1)
         pick_trans_err = np.linalg.norm(pred_flat[:, :3] - gt_flat[:, :3], axis=-1)
         place_trans_err = np.linalg.norm(pred_flat[:, 9:12] - gt_flat[:, 9:12], axis=-1)
         action_mse = np.mean((pred_flat - gt_flat) ** 2, axis=-1)
@@ -611,8 +626,8 @@ def evaluate_checkpoint(
         total_action_mse_sum += float(np.sum(action_mse))
         total_pick_action_mse_sum += float(np.sum(pick_action_mse))
         total_place_action_mse_sum += float(np.sum(place_action_mse))
-        total_pick_dof_l2_sum += float(np.sum(pick_err))
-        total_place_dof_l2_sum += float(np.sum(place_err))
+        total_pick_rot6d_l2_sum += float(np.sum(pick_rot6d_err))
+        total_place_rot6d_l2_sum += float(np.sum(place_rot6d_err))
         total_pick_trans_l2_sum += float(np.sum(pick_trans_err))
         total_place_trans_l2_sum += float(np.sum(place_trans_err))
 
@@ -642,14 +657,14 @@ def evaluate_checkpoint(
         "action_mse_avg": total_action_mse_sum / total_examples,
         "pick_action_mse": total_pick_action_mse_sum / total_examples,
         "place_action_mse": total_place_action_mse_sum / total_examples,
-        "pick_dof_l2": total_pick_dof_l2_sum / total_examples,
-        "place_dof_l2": total_place_dof_l2_sum / total_examples,
+        "pick_rot6d_l2": total_pick_rot6d_l2_sum / total_examples,
+        "place_rot6d_l2": total_place_rot6d_l2_sum / total_examples,
         "pick_trans_l2": total_pick_trans_l2_sum / total_examples,
         "place_trans_l2": total_place_trans_l2_sum / total_examples,
         "action_mse/pick": total_pick_action_mse_sum / total_examples,
         "action_mse/place": total_place_action_mse_sum / total_examples,
-        "dof_l2/pick": total_pick_dof_l2_sum / total_examples,
-        "dof_l2/place": total_place_dof_l2_sum / total_examples,
+        "rot6d_l2/pick": total_pick_rot6d_l2_sum / total_examples,
+        "rot6d_l2/place": total_place_rot6d_l2_sum / total_examples,
         "trans_l2/pick": total_pick_trans_l2_sum / total_examples,
         "trans_l2/place": total_place_trans_l2_sum / total_examples,
         "num_examples_used": float(total_examples),
@@ -667,35 +682,160 @@ def evaluate_checkpoint(
     return metrics, media
 
 
-def run_post_train_eval_sweep(config: _config.TrainConfig) -> None:
-    enabled = os.environ.get("POST_TRAIN_EVAL", "1").lower() not in {"0", "false", "no", "off"}
-    if not enabled:
-        logging.info("Post-train eval sweep disabled.")
-        return
+def checkpoint_eval_enabled() -> bool:
+    return os.environ.get("POST_TRAIN_EVAL", "1").lower() not in {"0", "false", "no", "off"}
 
+
+def _eval_runtime_options(config: _config.TrainConfig) -> tuple[str, str, int, int]:
     eval_repo_id = os.environ.get("EVAL_REPO_ID", "minyangli/pick_place_all_test")
     metric_prefix = os.environ.get("EVAL_METRIC_PREFIX", "test")
     batch_size = int(os.environ.get("EVAL_BATCH_SIZE", "16"))
     seed = int(os.environ.get("EVAL_SEED", str(config.seed)))
+    return eval_repo_id, metric_prefix, batch_size, seed
 
+
+def _eval_max_decoding_steps(config: _config.TrainConfig) -> int:
+    default = config.model.action_horizon * config.model.action_dim + 2
+    return int(os.environ.get("EVAL_MAX_DECODING_STEPS", str(default)))
+
+
+def _sweep_paths(checkpoint_root: epath.Path, metric_prefix: str) -> tuple[epath.Path, epath.Path, epath.Path]:
+    return (
+        checkpoint_root / f"{metric_prefix}_sweep.jsonl",
+        checkpoint_root / f"{metric_prefix}_sweep.latest.json",
+        checkpoint_root / f"{metric_prefix}_sweep.csv",
+    )
+
+
+def reset_eval_sweep_files(config: _config.TrainConfig) -> None:
+    _, metric_prefix, _, _ = _eval_runtime_options(config)
+    metrics_path, latest_metrics_path, csv_path = _sweep_paths(config.checkpoint_dir, metric_prefix)
+    for path in (metrics_path, latest_metrics_path, csv_path):
+        if path.exists():
+            path.unlink()
+
+
+def load_eval_token_ce_history(config: _config.TrainConfig) -> dict[int, dict[str, float]]:
+    _, metric_prefix, _, _ = _eval_runtime_options(config)
+    metrics_path, _, _ = _sweep_paths(config.checkpoint_dir, metric_prefix)
+    history: dict[int, dict[str, float]] = {}
+    if not metrics_path.exists():
+        return history
+
+    with metrics_path.open() as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                logging.warning("Skipping malformed eval sweep line in %s", metrics_path)
+                continue
+            step = payload.get("step")
+            if step is None:
+                continue
+            values = _token_ce_values_from_payload(payload, metric_prefix=metric_prefix)
+            if values:
+                history[int(step)] = values
+    return history
+
+
+def _define_eval_wandb_metrics(metric_prefix: str) -> str:
+    checkpoint_step_key = f"{metric_prefix}/checkpoint_step"
+    wandb.define_metric(f"{metric_prefix}/*", step_metric=checkpoint_step_key, overwrite=True)
+    wandb.define_metric("test_vis/*", step_metric=checkpoint_step_key, overwrite=True)
+    wandb.define_metric(checkpoint_step_key, hidden=True, overwrite=True)
+    return checkpoint_step_key
+
+
+def evaluate_and_log_checkpoint(
+    config: _config.TrainConfig,
+    *,
+    step: int,
+    token_ce_history: dict[int, dict[str, float]] | None = None,
+    model: Any | None = None,
+) -> bool:
+    if not checkpoint_eval_enabled():
+        logging.info("Checkpoint eval disabled.")
+        return False
+
+    eval_repo_id, metric_prefix, batch_size, seed = _eval_runtime_options(config)
+    checkpoint_root = config.checkpoint_dir
+    checkpoint_dir = checkpoint_root / str(step)
+    if not checkpoint_dir.exists():
+        logging.warning("Checkpoint eval skipped: %s does not exist", checkpoint_dir)
+        return False
+
+    metrics_path, latest_metrics_path, csv_path = _sweep_paths(checkpoint_root, metric_prefix)
+    checkpoint_step_key = _define_eval_wandb_metrics(metric_prefix)
+
+    logging.info(
+        "Evaluating checkpoint %s on %s with batch_size=%d",
+        checkpoint_dir,
+        eval_repo_id,
+        batch_size,
+    )
+    metrics, media = evaluate_checkpoint(
+        config,
+        checkpoint_dir=checkpoint_dir,
+        eval_repo_id=eval_repo_id,
+        batch_size=batch_size,
+        seed=seed,
+        model=model,
+        max_decoding_steps=_eval_max_decoding_steps(config),
+    )
+    payload = {
+        "eval_repo_id": eval_repo_id,
+        "step": step,
+        checkpoint_step_key: float(step),
+        **{f"{metric_prefix}/{k}": float(v) for k, v in metrics.items()},
+    }
+    _write_local_sweep_metrics(metrics_path, latest_metrics_path, csv_path, payload=payload)
+
+    if token_ce_history is None:
+        token_ce_history = {}
+    token_ce_history[step] = _token_ce_values_from_metrics(metrics)
+    token_ce_chart = _save_token_ce_chart(
+        checkpoint_dir / "test_vis",
+        step=step,
+        history=token_ce_history,
+    )
+    if token_ce_chart is not None:
+        media["test_vis/token_ce"] = wandb.Image(
+            str(token_ce_chart),
+            caption=f"checkpoint_step={step}; pick=solid, place=dashed",
+        )
+
+    wandb_payload = _eval_wandb_payload(
+        payload,
+        prefix=metric_prefix,
+        checkpoint_step_key=checkpoint_step_key,
+    )
+    wandb.log({**wandb_payload, **media})
+    logging.info(
+        "Eval step %d: ce=%.4f action_mse=%.4f pick_trans=%.4f place_trans=%.4f",
+        step,
+        payload[f"{metric_prefix}/mean_cross_entropy"],
+        payload[f"{metric_prefix}/action_mse"],
+        payload[f"{metric_prefix}/pick_trans_l2"],
+        payload[f"{metric_prefix}/place_trans_l2"],
+    )
+    return True
+
+
+def run_post_train_eval_sweep(config: _config.TrainConfig) -> None:
+    if not checkpoint_eval_enabled():
+        logging.info("Post-train eval sweep disabled.")
+        return
+
+    eval_repo_id, _, batch_size, _ = _eval_runtime_options(config)
     checkpoint_root = config.checkpoint_dir
     steps = list_checkpoint_steps(checkpoint_root)
     if not steps:
         logging.warning("Post-train eval skipped: no checkpoints found under %s", checkpoint_root)
         return
 
-    metrics_path = checkpoint_root / f"{metric_prefix}_sweep.jsonl"
-    latest_metrics_path = checkpoint_root / f"{metric_prefix}_sweep.latest.json"
-    csv_path = checkpoint_root / f"{metric_prefix}_sweep.csv"
-    for path in (metrics_path, latest_metrics_path, csv_path):
-        if path.exists():
-            path.unlink()
-
-    checkpoint_step_key = f"{metric_prefix}/checkpoint_step"
-    wandb.define_metric(f"{metric_prefix}/*", step_metric=checkpoint_step_key, overwrite=True)
-    wandb.define_metric("test_vis/*", step_metric=checkpoint_step_key, overwrite=True)
-    wandb.define_metric(checkpoint_step_key, hidden=True, overwrite=True)
-
+    reset_eval_sweep_files(config)
     logging.info(
         "Starting post-train eval sweep: repo=%s, checkpoints=%s, batch_size=%d",
         eval_repo_id,
@@ -704,53 +844,7 @@ def run_post_train_eval_sweep(config: _config.TrainConfig) -> None:
     )
     token_ce_history: dict[int, dict[str, float]] = {}
     for step in steps:
-        checkpoint_dir = checkpoint_root / str(step)
-        logging.info("Evaluating checkpoint %s on %s", checkpoint_dir, eval_repo_id)
-        metrics, media = evaluate_checkpoint(
-            config,
-            checkpoint_dir=checkpoint_dir,
-            eval_repo_id=eval_repo_id,
-            batch_size=batch_size,
-            seed=seed,
-        )
-        payload = {
-            "eval_repo_id": eval_repo_id,
-            "step": step,
-            checkpoint_step_key: float(step),
-            **{f"{metric_prefix}/{k}": float(v) for k, v in metrics.items()},
-        }
-        _write_local_sweep_metrics(metrics_path, latest_metrics_path, csv_path, payload=payload)
-        token_ce_history[step] = _token_ce_values_from_metrics(metrics)
-        token_ce_chart = _save_token_ce_chart(
-            checkpoint_dir / "test_vis",
-            step=step,
-            history=token_ce_history,
-        )
-        if token_ce_chart is not None:
-            media["test_vis/token_ce"] = wandb.Image(
-                str(token_ce_chart),
-                caption=f"checkpoint_step={step}; pick=solid, place=dashed",
-            )
-        wandb_payload = _eval_wandb_payload(
-            payload,
-            prefix=metric_prefix,
-            checkpoint_step_key=checkpoint_step_key,
-        )
-        wandb.log(
-            {
-                **wandb_payload,
-                **media,
-            },
-            step=step,
-        )
-        logging.info(
-            "Eval step %d: ce=%.4f action_mse=%.4f pick_trans=%.4f place_trans=%.4f",
-            step,
-            payload[f"{metric_prefix}/mean_cross_entropy"],
-            payload[f"{metric_prefix}/action_mse"],
-            payload[f"{metric_prefix}/pick_trans_l2"],
-            payload[f"{metric_prefix}/place_trans_l2"],
-        )
+        evaluate_and_log_checkpoint(config, step=step, token_ce_history=token_ce_history)
 
 
 def main(

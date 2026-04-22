@@ -170,8 +170,8 @@ def _probe_wandb_payload(metrics: dict[str, Any]) -> dict[str, float]:
     keep = (
         "probe/token_ce_avg",
         "probe/action_mse_avg",
-        "probe/pick_dof_l2",
-        "probe/place_dof_l2",
+        "probe/pick_rot6d_l2",
+        "probe/place_rot6d_l2",
         "probe/pick_trans_l2",
         "probe/place_trans_l2",
     )
@@ -465,6 +465,7 @@ def _save_token_ce_chart(
     ax.set_title("Probe per-token CE by step")
     ax.set_xlabel("train step")
     ax.set_ylabel("cross entropy")
+    ax.set_ylim(0, 6)
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
     fig.savefig(str(out_path))
@@ -522,6 +523,7 @@ def _evaluate_probe_batch(
     *,
     step: int,
     token_ce_history: dict[int, dict[str, float]] | None = None,
+    save_token_ce_chart: bool = False,
 ) -> tuple[dict[str, float], dict[str, Any]]:
     batch_pre = probe_context["batch"]
     batch_ce = _tokenize_collated_batch(batch_pre, probe_context["tokenize"], include_actions=True)
@@ -572,8 +574,8 @@ def _evaluate_probe_batch(
 
     pred_flat = np.asarray(pred_actions_raw[:, 0, :18], dtype=np.float64)
     gt_flat = np.asarray(gt_actions_raw[:, 0, :18], dtype=np.float64)
-    pick_err = np.linalg.norm(pred_flat[:, :9] - gt_flat[:, :9], axis=-1)
-    place_err = np.linalg.norm(pred_flat[:, 9:18] - gt_flat[:, 9:18], axis=-1)
+    pick_rot6d_err = np.linalg.norm(pred_flat[:, 3:9] - gt_flat[:, 3:9], axis=-1)
+    place_rot6d_err = np.linalg.norm(pred_flat[:, 12:18] - gt_flat[:, 12:18], axis=-1)
     pick_trans_err = np.linalg.norm(pred_flat[:, :3] - gt_flat[:, :3], axis=-1)
     place_trans_err = np.linalg.norm(pred_flat[:, 9:12] - gt_flat[:, 9:12], axis=-1)
     action_mse = np.mean((pred_flat - gt_flat) ** 2, axis=-1)
@@ -586,24 +588,25 @@ def _evaluate_probe_batch(
     token_ce_chart = None
     if token_ce_history is not None:
         token_ce_history[int(step)] = _token_ce_values_by_dof(ce_by_loss_pos)
-        token_ce_chart = _save_token_ce_chart(
-            vis_dir,
-            step=step,
-            history=token_ce_history,
-        )
+        if save_token_ce_chart:
+            token_ce_chart = _save_token_ce_chart(
+                vis_dir,
+                step=step,
+                history=token_ce_history,
+            )
     summary_path = vis_dir / f"step_{step:06d}_metrics.json"
 
     metrics = {
-        "probe/pick_dof_l2": float(np.mean(pick_err)),
-        "probe/place_dof_l2": float(np.mean(place_err)),
+        "probe/pick_rot6d_l2": float(np.mean(pick_rot6d_err)),
+        "probe/place_rot6d_l2": float(np.mean(place_rot6d_err)),
         "probe/pick_trans_l2": float(np.mean(pick_trans_err)),
         "probe/place_trans_l2": float(np.mean(place_trans_err)),
         "probe/action_mse": float(np.mean(action_mse)),
         "probe/ce": float(np.mean(per_example_ce)),
         "probe/token_ce_avg": token_ce_avg,
         "probe/action_mse_avg": float(np.mean(action_mse)),
-        "probe/dof_l2/pick": float(np.mean(pick_err)),
-        "probe/dof_l2/place": float(np.mean(place_err)),
+        "probe/rot6d_l2/pick": float(np.mean(pick_rot6d_err)),
+        "probe/rot6d_l2/place": float(np.mean(place_rot6d_err)),
         "probe/trans_l2/pick": float(np.mean(pick_trans_err)),
         "probe/trans_l2/place": float(np.mean(place_trans_err)),
         "probe/action_mse/pick": float(np.mean(pick_action_mse)),
@@ -697,14 +700,33 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
+    def scheduled_num_teacher_tokens(step: at.ArrayLike) -> at.Array:
+        action_token_count = config.model.action_horizon * config.model.action_dim + 2
+        final_teacher_tokens = int(np.clip(config.num_teacher_tokens, 0, action_token_count))
+        if config.self_forcing_warmup_steps <= 0 and config.self_forcing_ramp_steps <= 0:
+            return jnp.asarray(final_teacher_tokens, dtype=jnp.int32)
+
+        if config.self_forcing_ramp_steps <= 0:
+            return jnp.where(
+                step < config.self_forcing_warmup_steps,
+                jnp.asarray(action_token_count, dtype=jnp.int32),
+                jnp.asarray(final_teacher_tokens, dtype=jnp.int32),
+            )
+
+        progress = (step - config.self_forcing_warmup_steps) / config.self_forcing_ramp_steps
+        progress = jnp.clip(progress, 0.0, 1.0)
+        teacher_tokens = action_token_count + progress * (final_teacher_tokens - action_token_count)
+        return jnp.ceil(teacher_tokens).astype(jnp.int32)
+
     @at.typecheck
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
         if config.paradigm == "self_forcing":
+            teacher_tokens = scheduled_num_teacher_tokens(state.step)
             chunked_loss = model.compute_self_forcing_loss(
                 rng, observation, actions, train=True,
-                num_teacher_tokens=config.num_teacher_tokens,
+                num_teacher_tokens=teacher_tokens,
             )
         else:
             chunked_loss = model.compute_loss(rng, observation, actions, train=True)
@@ -748,6 +770,8 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+    if config.paradigm == "self_forcing":
+        info["num_teacher_tokens"] = scheduled_num_teacher_tokens(state.step)
     return new_state, info
 
 
@@ -783,6 +807,7 @@ def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
     enable_probe = os.environ.get("OPENPI_ENABLE_PROBE", "0").lower() in {"1", "true", "yes", "on"}
+    eval_on_checkpoint = _checkpoint_eval.checkpoint_eval_enabled()
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
@@ -807,6 +832,8 @@ def main(config: _config.TrainConfig):
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
     metrics_path = config.checkpoint_dir / "metrics.jsonl"
     latest_metrics_path = config.checkpoint_dir / "metrics.latest.json"
+    if eval_on_checkpoint and not resuming:
+        _checkpoint_eval.reset_eval_sweep_files(config)
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -837,6 +864,15 @@ def main(config: _config.TrainConfig):
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
     )
+    ptrain_step_warmup = None
+    if config.paradigm == "self_forcing" and config.self_forcing_warmup_steps > 0:
+        teacher_config = dataclasses.replace(config, paradigm="teacher_forcing")
+        ptrain_step_warmup = jax.jit(
+            functools.partial(train_step, teacher_config),
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+        )
     psample_actions = jax.jit(
         sample_actions_step,
         in_shardings=(replicated_sharding, train_state_sharding, replicated_sharding),
@@ -851,7 +887,6 @@ def main(config: _config.TrainConfig):
             probe_context,
             psample_actions,
             step=0,
-            token_ce_history=probe_token_ce_history,
         )
         _write_local_metrics(metrics_path, latest_metrics_path, step=0, metrics=probe_metrics)
         wandb.log(
@@ -870,9 +905,18 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
+    eval_token_ce_history = _checkpoint_eval.load_eval_token_ce_history(config) if resuming else {}
     for step in pbar:
         with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
+            active_train_step = ptrain_step
+            if ptrain_step_warmup is not None and step < config.self_forcing_warmup_steps:
+                active_train_step = ptrain_step_warmup
+            train_state, info = active_train_step(train_rng, train_state, batch)
+            if config.paradigm == "self_forcing" and step < config.self_forcing_warmup_steps:
+                info["num_teacher_tokens"] = jnp.asarray(
+                    config.model.action_horizon * config.model.action_dim + 2,
+                    dtype=jnp.int32,
+                )
         infos.append(info)
         numeric_log_payload: dict[str, float] = {}
         media_log_payload: dict[str, Any] = {}
@@ -894,6 +938,7 @@ def main(config: _config.TrainConfig):
                 psample_actions,
                 step=step,
                 token_ce_history=probe_token_ce_history,
+                save_token_ce_chart=step == config.num_train_steps - 1,
             )
             numeric_log_payload.update(probe_metrics)
             media_log_payload.update(probe_media)
@@ -909,12 +954,23 @@ def main(config: _config.TrainConfig):
             )
         batch = next(data_iter)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+        should_save = (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1
+        if should_save:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            if eval_on_checkpoint:
+                logging.info("Waiting for checkpoint %d to finish before eval", step)
+                checkpoint_manager.wait_until_finished()
+                eval_model = nnx.merge(train_state.model_def, train_state.params)
+                eval_model.eval()
+                _checkpoint_eval.evaluate_and_log_checkpoint(
+                    config,
+                    step=step,
+                    token_ce_history=eval_token_ce_history,
+                    model=eval_model,
+                )
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
-    _checkpoint_eval.run_post_train_eval_sweep(config)
 
 
 if __name__ == "__main__":

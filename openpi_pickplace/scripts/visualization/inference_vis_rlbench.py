@@ -1030,8 +1030,8 @@ def _summarize_match_rate(
 
     total_h = perfect + neighbor + far + invalid
 
-    pick_l2 = [s["pick_dof_l2"] for s in stats_list if s.get("pick_dof_l2") is not None]
-    place_l2 = [s["place_dof_l2"] for s in stats_list if s.get("place_dof_l2") is not None]
+    pick_l2 = [s["pick_rot6d_l2"] for s in stats_list if s.get("pick_rot6d_l2") is not None]
+    place_l2 = [s["place_rot6d_l2"] for s in stats_list if s.get("place_rot6d_l2") is not None]
     pick_tr = [s["pick_trans_l2"] for s in stats_list if s.get("pick_trans_l2") is not None]
     place_tr = [s["place_trans_l2"] for s in stats_list if s.get("place_trans_l2") is not None]
 
@@ -1076,13 +1076,13 @@ def _summarize_match_rate(
         print(f"  pred_decode   : mean={p_mean:.5f}  median={p_med:.5f}  (ratio {ratio:.2f}× over oracle)")
 
     if pick_l2 or place_l2:
-        print("\nWorld-space dof L2 (unnormalized, all 9 dims):")
+        print("\nRotation 6D L2 (unnormalized, dims 3:9):")
         if pick_l2:
             m, med, p75, p95 = _percentiles(pick_l2)
-            print(f"  pick_dof  (N={len(pick_l2):3d}) : mean={m:.4f}  median={med:.4f}  p75={p75:.4f}  p95={p95:.4f}")
+            print(f"  pick_rot6d  (N={len(pick_l2):3d}) : mean={m:.4f}  median={med:.4f}  p75={p75:.4f}  p95={p95:.4f}")
         if place_l2:
             m, med, p75, p95 = _percentiles(place_l2)
-            print(f"  place_dof (N={len(place_l2):3d}) : mean={m:.4f}  median={med:.4f}  p75={p75:.4f}  p95={p95:.4f}")
+            print(f"  place_rot6d (N={len(place_l2):3d}) : mean={m:.4f}  median={med:.4f}  p75={p75:.4f}  p95={p95:.4f}")
     if pick_tr or place_tr:
         print("\nTranslation-only L2 (first 3 dims, meters):")
         if pick_tr:
@@ -1107,14 +1107,14 @@ def _summarize_match_rate(
             cs_str = f"{cs:+.2f}" if cs is not None else "  n/a"
             pmse = float(s.get("pred_recon_mse") or 0.0)
             pick_s = (
-                f"pick_L2={s['pick_dof_l2']:.3f}"
-                if s.get("pick_dof_l2") is not None
-                else "pick_L2=  n/a"
+                f"pick_rot6d_L2={s['pick_rot6d_l2']:.3f}"
+                if s.get("pick_rot6d_l2") is not None
+                else "pick_rot6d_L2=  n/a"
             )
             place_s = (
-                f"place_L2={s['place_dof_l2']:.3f}"
-                if s.get("place_dof_l2") is not None
-                else "place_L2=  n/a"
+                f"place_rot6d_L2={s['place_rot6d_l2']:.3f}"
+                if s.get("place_rot6d_l2") is not None
+                else "place_rot6d_L2=  n/a"
             )
             print(
                 f"  sample_idx={s['sample_idx']:3d}  oracle={oc:3d}  pred={pc:3d}  "
@@ -1270,23 +1270,23 @@ def main(
             pl = result.get("place_dof")
             gt_dof = _gt_pick_place_dof9_from_sample(row)
 
-            pick_dof_l2: float | None = None
-            place_dof_l2: float | None = None
+            pick_rot6d_l2: float | None = None
+            place_rot6d_l2: float | None = None
             pick_trans_l2: float | None = None
             place_trans_l2: float | None = None
             if gt_dof is not None and pk is not None and pl is not None:
                 gtp, gtl = gt_dof
                 pk9 = np.asarray(pk).reshape(-1)[:9]
                 pl9 = np.asarray(pl).reshape(-1)[:9]
-                pick_dof_l2 = float(np.linalg.norm(pk9 - gtp))
-                place_dof_l2 = float(np.linalg.norm(pl9 - gtl))
+                pick_rot6d_l2 = float(np.linalg.norm(pk9[3:9] - gtp[3:9]))
+                place_rot6d_l2 = float(np.linalg.norm(pl9[3:9] - gtl[3:9]))
                 pick_trans_l2 = float(np.linalg.norm(pk9[:3] - gtp[:3]))
                 place_trans_l2 = float(np.linalg.norm(pl9[:3] - gtl[:3]))
 
             sample_stats: dict = {
                 "sample_idx": idx,
-                "pick_dof_l2": pick_dof_l2,
-                "place_dof_l2": place_dof_l2,
+                "pick_rot6d_l2": pick_rot6d_l2,
+                "place_rot6d_l2": place_rot6d_l2,
                 "pick_trans_l2": pick_trans_l2,
                 "place_trans_l2": place_trans_l2,
             }
@@ -1323,17 +1323,17 @@ def main(
                     tag = "✓" if oc == pc and pc >= 0 else "✗"
                     omse = oracle_stats.get("oracle_recon_mse") or 0.0
                     pmse = oracle_stats.get("pred_recon_mse") or 0.0
-                    pick_s = f"{pick_dof_l2:.3f}" if pick_dof_l2 is not None else "  n/a"
-                    place_s = f"{place_dof_l2:.3f}" if place_dof_l2 is not None else "  n/a"
+                    pick_s = f"{pick_rot6d_l2:.3f}" if pick_rot6d_l2 is not None else "  n/a"
+                    place_s = f"{place_rot6d_l2:.3f}" if place_rot6d_l2 is not None else "  n/a"
                     print(
                         f"sample={idx:3d}  oracle={oc:3d} pred={pc:3d} {tag}  "
                         f"cos={cs_str}  oracle_mse={omse:.4f} pred_mse={pmse:.4f}  "
-                        f"pick_L2={pick_s}  place_L2={place_s}"
+                        f"pick_rot6d_L2={pick_s}  place_rot6d_L2={place_s}"
                     )
                 else:
-                    pick_s = f"{pick_dof_l2:.3f}" if pick_dof_l2 is not None else "  n/a"
-                    place_s = f"{place_dof_l2:.3f}" if place_dof_l2 is not None else "  n/a"
-                    print(f"sample={idx:3d}  pick_L2={pick_s}  place_L2={place_s}")
+                    pick_s = f"{pick_rot6d_l2:.3f}" if pick_rot6d_l2 is not None else "  n/a"
+                    place_s = f"{place_rot6d_l2:.3f}" if place_rot6d_l2 is not None else "  n/a"
+                    print(f"sample={idx:3d}  pick_rot6d_L2={pick_s}  place_rot6d_L2={place_s}")
 
             # --- Visualization (per-sample file path) ---
             per_sample_vis = _vis_sample_output(vis_output, idx, multi_sample=multi_sample)

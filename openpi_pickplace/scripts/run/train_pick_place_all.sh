@@ -13,7 +13,7 @@ fi
 export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-/mnt/nas/minyangli}"
 export HF_HOME="${HF_HOME:-/tmp/hf_home}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/tmp/hf_datasets_cache}"
-export OPENPI_ENABLE_PROBE="${OPENPI_ENABLE_PROBE:-1}"
+export OPENPI_ENABLE_PROBE="${OPENPI_ENABLE_PROBE:-0}"
 export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}"

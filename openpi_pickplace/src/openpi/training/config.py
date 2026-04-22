@@ -594,6 +594,10 @@ class TrainConfig:
     # (self_forcing only) Number of action tokens that are still teacher-forced
     # before switching to model's own predictions.
     num_teacher_tokens: int = 2
+    # (self_forcing only) If nonzero, start with all action tokens teacher-forced
+    # for this many steps, then linearly decay to num_teacher_tokens.
+    self_forcing_warmup_steps: int = 0
+    self_forcing_ramp_steps: int = 0
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -640,6 +644,12 @@ def _pickplace_all_qbin64_config(name: str) -> TrainConfig:
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=1e-5,
+            decay_steps=2_500,
+            decay_lr=1e-6,
+        ),
         num_train_steps=30_000,
         freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
         ema_decay=None,
@@ -668,6 +678,12 @@ def _pickplace_all_uniform_config(name: str) -> TrainConfig:
             base_config=DataConfig(prompt_from_task=True),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=1e-5,
+            decay_steps=2_500,
+            decay_lr=1e-6,
+        ),
         num_train_steps=30_000,
         freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
         ema_decay=None,
