@@ -178,6 +178,22 @@ def _probe_wandb_payload(metrics: dict[str, Any]) -> dict[str, float]:
     return {key: float(metrics[key]) for key in keep if key in metrics}
 
 
+def _resolve_best_checkpoint_metric(metrics: dict[str, Any], metric_name: str) -> float | None:
+    candidates = [metric_name]
+    if "/" not in metric_name:
+        candidates.extend(
+            [
+                f"probe/{metric_name}",
+                f"probe/{metric_name}_avg",
+                f"test/{metric_name}",
+            ]
+        )
+    metric_value = next((metrics[key] for key in candidates if key in metrics), None)
+    if metric_value is None:
+        return None
+    return float(metric_value)
+
+
 FRONT_CAMERA_INTRINSICS = np.array(
     [
         [-175.83856040078922, 0.0, 64.0],
@@ -828,6 +844,7 @@ def main(config: _config.TrainConfig):
         keep_period=config.keep_period,
         overwrite=config.overwrite,
         resume=config.resume,
+        retention_mode=config.checkpoint_retention,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
     metrics_path = config.checkpoint_dir / "metrics.jsonl"
@@ -856,7 +873,12 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = _checkpoints.restore_state(
+            checkpoint_manager,
+            train_state,
+            data_loader,
+            state_sharding=train_state_sharding,
+        )
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -906,6 +928,19 @@ def main(config: _config.TrainConfig):
 
     infos = []
     eval_token_ce_history = _checkpoint_eval.load_eval_token_ce_history(config) if resuming else {}
+    best_checkpoint = (
+        _checkpoints.load_best_checkpoint_record(config.checkpoint_dir)
+        if config.checkpoint_retention == "best_only"
+        else None
+    )
+    if best_checkpoint is not None and best_checkpoint.step not in set(checkpoint_manager.all_steps()):
+        logging.warning(
+            "Ignoring stale best checkpoint metadata for missing step %d.",
+            best_checkpoint.step,
+        )
+        best_checkpoint = None
+    if config.checkpoint_retention == "best_only" and best_checkpoint is not None:
+        _checkpoints.prune_checkpoints(checkpoint_manager, keep_steps={best_checkpoint.step})
     for step in pbar:
         with sharding.set_mesh(mesh):
             active_train_step = ptrain_step
@@ -957,17 +992,66 @@ def main(config: _config.TrainConfig):
         should_save = (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1
         if should_save:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            best_metric_source: dict[str, Any] | None = None
             if eval_on_checkpoint:
                 logging.info("Waiting for checkpoint %d to finish before eval", step)
                 checkpoint_manager.wait_until_finished()
                 eval_model = nnx.merge(train_state.model_def, train_state.params)
                 eval_model.eval()
-                _checkpoint_eval.evaluate_and_log_checkpoint(
+                best_metric_source = _checkpoint_eval.evaluate_and_log_checkpoint(
                     config,
                     step=step,
                     token_ce_history=eval_token_ce_history,
                     model=eval_model,
                 )
+            elif config.checkpoint_retention == "best_only":
+                logging.info("Waiting for checkpoint %d to finish before best-checkpoint retention", step)
+                checkpoint_manager.wait_until_finished()
+                best_metric_source = numeric_log_payload
+
+            if config.checkpoint_retention == "best_only":
+                metric_value = None if best_metric_source is None else _resolve_best_checkpoint_metric(
+                    best_metric_source,
+                    config.best_checkpoint_metric,
+                )
+                if metric_value is None:
+                    logging.warning(
+                        "Best checkpoint retention skipped for step %d: metric %s not found.",
+                        step,
+                        config.best_checkpoint_metric,
+                    )
+                else:
+                    is_best = _checkpoints.is_better_checkpoint(
+                        metric_value,
+                        best_checkpoint,
+                        mode=config.best_checkpoint_mode,
+                    )
+                    if is_best:
+                        best_checkpoint = _checkpoints.BestCheckpointRecord(
+                            step=step,
+                            metric=metric_value,
+                            metric_key=config.best_checkpoint_metric,
+                            mode=config.best_checkpoint_mode,
+                        )
+                        _checkpoints.save_best_checkpoint_record(config.checkpoint_dir, best_checkpoint)
+                        logging.info(
+                            "Checkpoint %d is the new best: %s=%.6f",
+                            step,
+                            config.best_checkpoint_metric,
+                            metric_value,
+                        )
+                    else:
+                        logging.info(
+                            "Checkpoint %d is not better than current best step %d: %s=%.6f vs %.6f",
+                            step,
+                            best_checkpoint.step,
+                            config.best_checkpoint_metric,
+                            metric_value,
+                            best_checkpoint.metric,
+                        )
+
+                    keep_steps = {best_checkpoint.step} if best_checkpoint is not None else {step}
+                    _checkpoints.prune_checkpoints(checkpoint_manager, keep_steps=keep_steps)
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

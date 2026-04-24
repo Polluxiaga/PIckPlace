@@ -754,17 +754,17 @@ def evaluate_and_log_checkpoint(
     step: int,
     token_ce_history: dict[int, dict[str, float]] | None = None,
     model: Any | None = None,
-) -> bool:
+) -> dict[str, float] | None:
     if not checkpoint_eval_enabled():
         logging.info("Checkpoint eval disabled.")
-        return False
+        return None
 
     eval_repo_id, metric_prefix, batch_size, seed = _eval_runtime_options(config)
     checkpoint_root = config.checkpoint_dir
     checkpoint_dir = checkpoint_root / str(step)
     if not checkpoint_dir.exists():
         logging.warning("Checkpoint eval skipped: %s does not exist", checkpoint_dir)
-        return False
+        return None
 
     metrics_path, latest_metrics_path, csv_path = _sweep_paths(checkpoint_root, metric_prefix)
     checkpoint_step_key = _define_eval_wandb_metrics(metric_prefix)
@@ -820,7 +820,7 @@ def evaluate_and_log_checkpoint(
         payload[f"{metric_prefix}/pick_trans_l2"],
         payload[f"{metric_prefix}/place_trans_l2"],
     )
-    return True
+    return {k: float(v) for k, v in metrics.items()}
 
 
 def run_post_train_eval_sweep(config: _config.TrainConfig) -> None:

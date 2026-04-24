@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as futures
 import dataclasses
+import json
 import logging
 from typing import Protocol
 
 from etils import epath
 import jax
+import numpy as np
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
 
@@ -17,8 +19,24 @@ import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 
 
+BEST_CHECKPOINT_METADATA = "best_checkpoint.json"
+
+
+@dataclasses.dataclass(frozen=True)
+class BestCheckpointRecord:
+    step: int
+    metric: float
+    metric_key: str
+    mode: str
+
+
 def initialize_checkpoint_dir(
-    checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
+    checkpoint_dir: epath.Path | str,
+    *,
+    keep_period: int | None,
+    overwrite: bool,
+    resume: bool,
+    retention_mode: str = "latest_and_periodic",
 ) -> tuple[ocp.CheckpointManager, bool]:
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
@@ -37,6 +55,14 @@ def initialize_checkpoint_dir(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    max_to_keep = 1
+    effective_keep_period = keep_period
+    if retention_mode == "latest_only":
+        effective_keep_period = None
+    elif retention_mode == "best_only":
+        max_to_keep = None
+        effective_keep_period = None
+
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
         item_handlers={
@@ -45,8 +71,8 @@ def initialize_checkpoint_dir(
             "params": ocp.PyTreeCheckpointHandler(),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=1,
-            keep_period=keep_period,
+            max_to_keep=max_to_keep,
+            keep_period=effective_keep_period,
             create=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),
@@ -118,19 +144,38 @@ def restore_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int | None = None,
+    *,
+    state_sharding=None,
 ) -> training_utils.TrainState:
     del data_loader
 
     with at.disable_typechecking():
         # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
-        restored = checkpoint_manager.restore(
-            step,
-            items={
-                "train_state": train_state,
-                "params": {"params": params},
-            },
-        )
+        if state_sharding is None:
+            restored = checkpoint_manager.restore(
+                step,
+                items={
+                    "train_state": train_state,
+                    "params": {"params": params},
+                },
+            )
+        else:
+            train_state_sharding, params_sharding = _split_params(state_sharding)
+            logging.info("Restoring checkpoint with explicit target shardings.")
+            restored = checkpoint_manager.restore(
+                step,
+                args=ocp.args.Composite(
+                    train_state=ocp.args.PyTreeRestore(
+                        item=train_state,
+                        restore_args=_build_restore_args(train_state, train_state_sharding),
+                    ),
+                    params=ocp.args.PyTreeRestore(
+                        item={"params": params},
+                        restore_args={"params": _build_restore_args(params, params_sharding)},
+                    ),
+                ),
+            )
     return _merge_params(restored["train_state"], restored["params"])
 
 
@@ -184,3 +229,75 @@ def _merge_params(train_state: training_utils.TrainState, params: dict[str, at.P
     if train_state.params:
         return dataclasses.replace(train_state, ema_params=params["params"])
     return dataclasses.replace(train_state, params=params["params"])
+
+
+def load_best_checkpoint_record(checkpoint_dir: epath.Path | str) -> BestCheckpointRecord | None:
+    path = epath.Path(checkpoint_dir) / BEST_CHECKPOINT_METADATA
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        logging.warning("Ignoring malformed best checkpoint metadata at %s", path)
+        return None
+    try:
+        return BestCheckpointRecord(
+            step=int(payload["step"]),
+            metric=float(payload["metric"]),
+            metric_key=str(payload["metric_key"]),
+            mode=str(payload["mode"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        logging.warning("Ignoring incomplete best checkpoint metadata at %s", path)
+        return None
+
+
+def save_best_checkpoint_record(checkpoint_dir: epath.Path | str, record: BestCheckpointRecord) -> None:
+    path = epath.Path(checkpoint_dir) / BEST_CHECKPOINT_METADATA
+    path.write_text(json.dumps(dataclasses.asdict(record), indent=2, sort_keys=True) + "\n")
+
+
+def is_better_checkpoint(metric: float, best: BestCheckpointRecord | None, *, mode: str) -> bool:
+    if best is None:
+        return True
+    if mode == "min":
+        return metric < best.metric
+    if mode == "max":
+        return metric > best.metric
+    raise ValueError(f"Unsupported best checkpoint mode: {mode}")
+
+
+def prune_checkpoints(checkpoint_manager: ocp.CheckpointManager, *, keep_steps: set[int]) -> None:
+    for saved_step in tuple(checkpoint_manager.all_steps()):
+        if saved_step not in keep_steps:
+            checkpoint_manager.delete(saved_step)
+
+
+def _build_restore_args(item, shardings):
+    def _restore_arg(leaf, leaf_sharding):
+        if isinstance(leaf, jax.ShapeDtypeStruct):
+            return ocp.ArrayRestoreArgs(
+                restore_type=jax.Array,
+                dtype=leaf.dtype,
+                sharding=leaf.sharding or leaf_sharding,
+                global_shape=leaf.shape,
+            )
+        if isinstance(leaf, jax.Array):
+            return ocp.ArrayRestoreArgs(
+                restore_type=jax.Array,
+                dtype=leaf.dtype,
+                sharding=leaf.sharding,
+                global_shape=leaf.shape,
+            )
+        if isinstance(leaf, np.ndarray):
+            return ocp.ArrayRestoreArgs(restore_type=np.ndarray, dtype=leaf.dtype, global_shape=leaf.shape)
+        if hasattr(leaf, "shape") and hasattr(leaf, "dtype"):
+            return ocp.ArrayRestoreArgs(
+                restore_type=jax.Array,
+                dtype=leaf.dtype,
+                sharding=leaf_sharding,
+                global_shape=leaf.shape,
+            )
+        return None
+
+    return jax.tree.map(_restore_arg, item, shardings)
