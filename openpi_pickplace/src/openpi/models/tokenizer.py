@@ -621,6 +621,163 @@ class VQActionTokenizer(FASTTokenizer):
         return out.reshape(action_horizon, self.dof_dim)
 
 
+class PhaseVQActionTokenizer(FASTTokenizer):
+    """Pick/place phase-conditioned vector VQ tokenizer.
+
+    Each timestep is represented by two tokens instead of 18 scalar tokens:
+
+    * one token for the full 9-D pick pose
+    * one token for the full 9-D place pose
+
+    The decoded action is still the usual 18-D ``[pick, place]`` vector, so eval and
+    policy code can stay on the same action contract. Use this with
+    ``Pi0FASTConfig(action_dim=2, action_horizon=1)`` because ``action_dim`` is the
+    number of generated action-code tokens for FAST training.
+    """
+
+    def __init__(
+        self,
+        max_len: int = 256,
+        *,
+        pick_dim: int = 9,
+        place_dim: int = 9,
+        codebook_size: int = 64,
+        pick_codebook_path: str,
+        place_codebook_path: str,
+        fast_skip_tokens: int = 128,
+    ):
+        self._max_len = max_len
+        self.pick_dim = pick_dim
+        self.place_dim = place_dim
+        self.dof_dim = pick_dim + place_dim
+        self._n_bins = codebook_size
+        self._codebook_size = codebook_size
+        self._fast_skip_tokens = fast_skip_tokens
+
+        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        with path.open("rb") as f:
+            self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+        self._pick_codebook = np.load(pick_codebook_path).astype(np.float32)
+        self._place_codebook = np.load(place_codebook_path).astype(np.float32)
+        expected_pick = (codebook_size, pick_dim)
+        expected_place = (codebook_size, place_dim)
+        if self._pick_codebook.shape != expected_pick:
+            raise ValueError(
+                f"pick_codebook shape mismatch: expected {expected_pick}, got {self._pick_codebook.shape}"
+            )
+        if self._place_codebook.shape != expected_place:
+            raise ValueError(
+                f"place_codebook shape mismatch: expected {expected_place}, got {self._place_codebook.shape}"
+            )
+        logging.info(
+            "PhaseVQActionTokenizer: loaded pick codebook %s from %s and place codebook %s from %s",
+            self._pick_codebook.shape,
+            pick_codebook_path,
+            self._place_codebook.shape,
+            place_codebook_path,
+        )
+
+    def _codes_to_paligemma_ids(self, codes: np.ndarray) -> np.ndarray:
+        v = self._paligemma_tokenizer.vocab_size()
+        return v - 1 - self._fast_skip_tokens - codes
+
+    def _paligemma_ids_to_codes(self, token_ids: np.ndarray | list[int]) -> np.ndarray:
+        t = np.asarray(token_ids, dtype=np.int64)
+        v = self._paligemma_tokenizer.vocab_size()
+        return v - 1 - self._fast_skip_tokens - t
+
+    def _nearest_codes(self, vectors: np.ndarray, codebook: np.ndarray) -> np.ndarray:
+        vectors = np.asarray(vectors, dtype=np.float32)
+        diff = vectors[:, None, :] - codebook[None, :, :]
+        return np.argmin(np.sum(diff * diff, axis=-1), axis=-1).astype(np.int64)
+
+    def tokenize(
+        self, prompt: str, state: np.ndarray, actions: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        cleaned_text = prompt.lower().strip().replace("_", " ")
+
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+        prefix = f"Task: {cleaned_text}, State: {state_str};\n"
+        prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
+
+        action_prefix_tokens = self._paligemma_tokenizer.encode("Action: ")
+        if actions is not None:
+            a = np.asarray(actions, dtype=np.float32)
+            if a.ndim == 1:
+                a = a[np.newaxis, :]
+            if a.shape[-1] != self.dof_dim:
+                raise ValueError(
+                    f"actions last dim must be pick_dim+place_dim={self.dof_dim}, got {a.shape[-1]}"
+                )
+
+            pick_codes = self._nearest_codes(a[:, : self.pick_dim], self._pick_codebook)
+            place_codes = self._nearest_codes(a[:, self.pick_dim : self.dof_dim], self._place_codebook)
+            codes = np.stack([pick_codes, place_codes], axis=-1).reshape(-1)
+            pg_ids = self._codes_to_paligemma_ids(codes)
+            action_content_tokens = pg_ids.astype(int).tolist() + self._paligemma_tokenizer.encode("|", add_eos=True)
+            postfix_tokens = action_prefix_tokens + action_content_tokens
+        else:
+            action_content_tokens = []
+            postfix_tokens = action_prefix_tokens
+
+        tokens = prefix_tokens + postfix_tokens
+        token_mask = [True] * len(tokens)
+        ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
+        loss_mask = (
+            [False] * len(prefix_tokens)
+            + [False] * len(action_prefix_tokens)
+            + [True] * len(action_content_tokens)
+        )
+
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            padding = [False] * (self._max_len - tokens_len)
+            tokens = tokens + padding
+            token_mask = token_mask + padding
+            ar_mask = ar_mask + padding
+            loss_mask = loss_mask + padding
+        else:
+            if len(tokens) > self._max_len:
+                logging.warning(f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating.")
+            tokens = tokens[: self._max_len]
+            token_mask = token_mask[: self._max_len]
+            ar_mask = ar_mask[: self._max_len]
+            loss_mask = loss_mask[: self._max_len]
+
+        return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
+
+    def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
+        if action_dim != 2:
+            logging.warning(
+                "PhaseVQActionTokenizer expects FAST action_dim=2 code tokens, got %s",
+                action_dim,
+            )
+        need = action_horizon * 2
+        all_codes = self._paligemma_ids_to_codes(tokens[:need])
+
+        out = np.zeros((action_horizon, self.dof_dim), dtype=np.float32)
+        for h in range(action_horizon):
+            pick_pos = 2 * h
+            place_pos = pick_pos + 1
+            if pick_pos < len(all_codes):
+                pick_code = int(all_codes[pick_pos])
+                if 0 <= pick_code < self._codebook_size:
+                    out[h, : self.pick_dim] = self._pick_codebook[pick_code]
+                elif 0 <= pick_code < 1024:
+                    out[h, : self.pick_dim] = self._pick_codebook[int(np.clip(pick_code, 0, self._codebook_size - 1))]
+            if place_pos < len(all_codes):
+                place_code = int(all_codes[place_pos])
+                if 0 <= place_code < self._codebook_size:
+                    out[h, self.pick_dim : self.dof_dim] = self._place_codebook[place_code]
+                elif 0 <= place_code < 1024:
+                    out[h, self.pick_dim : self.dof_dim] = self._place_codebook[
+                        int(np.clip(place_code, 0, self._codebook_size - 1))
+                    ]
+        return out
+
+
 class VQVAEActionTokenizer(FASTTokenizer):
     """Joint VQ-VAE action tokenizer: each 18-D action uses **one** code token.
 

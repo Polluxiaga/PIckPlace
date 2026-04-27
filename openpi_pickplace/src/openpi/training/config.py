@@ -575,7 +575,7 @@ class TrainConfig:
     # - latest_and_periodic: keep latest plus any checkpoint that matches keep_period.
     # - latest_only: keep only the latest checkpoint.
     # - best_only: keep only the best checkpoint according to best_checkpoint_metric.
-    checkpoint_retention: Literal["latest_and_periodic", "latest_only", "best_only"] = "latest_and_periodic"
+    checkpoint_retention: Literal["latest_and_periodic", "latest_only", "best_only"] = "best_only"
     # Metric used when checkpoint_retention=best_only.
     best_checkpoint_metric: str = "action_mse"
     # Whether smaller or larger values are better for best_checkpoint_metric.
@@ -718,6 +718,43 @@ def _pickplace_all_vq_config(name: str) -> TrainConfig:
         data=LeRobotRLBenchPickPlaceDataConfig(
             repo_id="minyangli/pick_place_all",
             # Reuse the existing normalized stats; VQ-specific assets live under assets/{name}/...
+            assets=AssetsConfig(assets_dir="assets/pickplace_all_qbin64", asset_id="pick_place_all"),
+            num_ctx_frames=1,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=1e-5,
+            decay_steps=2_500,
+            decay_lr=1e-6,
+        ),
+        num_train_steps=30_000,
+        freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
+        ema_decay=None,
+    )
+
+
+def _pickplace_all_phase_vq_config(name: str) -> TrainConfig:
+    return TrainConfig(
+        name=name,
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=2,
+            action_horizon=1,
+            max_token_len=512,
+            paligemma_variant="gemma_2b_lora",
+            fast_model_tokenizer=_tokenizer.PhaseVQActionTokenizer,
+            fast_model_tokenizer_kwargs={
+                "pick_dim": 9,
+                "place_dim": 9,
+                "codebook_size": 64,
+                "pick_codebook_path": f"assets/{name}/pick_place_all/pick_codebook.npy",
+                "place_codebook_path": f"assets/{name}/pick_place_all/place_codebook.npy",
+            },
+        ),
+        data=LeRobotRLBenchPickPlaceDataConfig(
+            repo_id="minyangli/pick_place_all",
+            # Reuse the existing normalized stats; phase-VQ-specific assets live under assets/{name}/...
             assets=AssetsConfig(assets_dir="assets/pickplace_all_qbin64", asset_id="pick_place_all"),
             num_ctx_frames=1,
             base_config=DataConfig(prompt_from_task=True),
@@ -925,6 +962,7 @@ _CONFIGS = [
     _pickplace_all_qbin64_config("pickplace_all_qbin64"),
     _pickplace_all_uniform_config("pickplace_all_uniform"),
     _pickplace_all_vq_config("pickplace_all_vq64"),
+    _pickplace_all_phase_vq_config("pickplace_all_phase_vq64"),
 
     #####################################################################################################
     TrainConfig(

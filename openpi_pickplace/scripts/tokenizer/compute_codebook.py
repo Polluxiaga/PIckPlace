@@ -15,6 +15,11 @@ Example:
     uv run scripts/tokenizer/compute_codebook.py \
       --config-name pickplace_all_vq64 \
       --codebook-size 64
+
+    uv run scripts/tokenizer/compute_codebook.py \
+      --config-name pickplace_all_phase_vq64 \
+      --codebook-size 64 \
+      --split-phases
 """
 
 from __future__ import annotations
@@ -97,9 +102,46 @@ def _run_1d_kmeans(
     return centers.astype(np.float32)
 
 
+def _run_kmeans(
+    values: np.ndarray,
+    *,
+    k: int,
+    max_iters: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Lloyd's algorithm for vector VQ codebooks."""
+    x = np.asarray(values, dtype=np.float32)
+    if x.ndim != 2 or x.shape[0] == 0:
+        raise ValueError(f"expected non-empty 2-D values, got shape {x.shape}")
+
+    replace = x.shape[0] < k
+    init_idx = rng.choice(x.shape[0], size=k, replace=replace)
+    centers = x[init_idx].astype(np.float32, copy=True)
+
+    for _ in range(max_iters):
+        distances = np.sum((x[:, None, :] - centers[None, :, :]) ** 2, axis=-1)
+        assignments = np.argmin(distances, axis=-1)
+        new_centers = centers.copy()
+        for idx in range(k):
+            mask = assignments == idx
+            if np.any(mask):
+                new_centers[idx] = x[mask].mean(axis=0)
+            else:
+                new_centers[idx] = x[rng.integers(0, x.shape[0])]
+        if np.allclose(new_centers, centers, atol=1e-6, rtol=0.0):
+            centers = new_centers
+            break
+        centers = new_centers
+
+    return centers.astype(np.float32)
+
+
 def main(
     config_name: str,
     codebook_size: int = 64,
+    split_phases: bool = False,
+    pick_dim: int = 9,
+    place_dim: int = 9,
     max_frames: int | None = None,
     max_iters: int = 50,
     seed: int = 42,
@@ -170,27 +212,49 @@ def main(
     action_dim = all_actions_arr.shape[1]
     print(f"Collected {all_actions_arr.shape[0]} samples x {action_dim} dims")
 
+    output_dir = config.assets_dirs / (data_config_no_tok.asset_id or data_config_no_tok.repo_id)
+    output_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
-    codebook = np.zeros((action_dim, codebook_size), dtype=np.float32)
-    for d in range(action_dim):
-        codebook[d] = _run_1d_kmeans(
-            all_actions_arr[:, d],
+    if split_phases:
+        expected_dim = pick_dim + place_dim
+        if action_dim != expected_dim:
+            raise ValueError(f"split_phases expected action_dim={expected_dim}, got {action_dim}")
+        pick_codebook = _run_kmeans(
+            all_actions_arr[:, :pick_dim],
             k=codebook_size,
             max_iters=max_iters,
             rng=rng,
         )
-
-    output_dir = config.assets_dirs / (data_config_no_tok.asset_id or data_config_no_tok.repo_id)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "codebook.npy"
-    np.save(str(output_path), codebook)
-    print(f"Saved codebook shape={codebook.shape} to {output_path}")
-
-    for d in range(min(action_dim, 6)):
-        print(
-            f"  dim {d}: center_min={codebook[d, 0]:.6f} "
-            f"center_max={codebook[d, -1]:.6f}"
+        place_codebook = _run_kmeans(
+            all_actions_arr[:, pick_dim:expected_dim],
+            k=codebook_size,
+            max_iters=max_iters,
+            rng=rng,
         )
+        pick_output_path = output_dir / "pick_codebook.npy"
+        place_output_path = output_dir / "place_codebook.npy"
+        np.save(str(pick_output_path), pick_codebook)
+        np.save(str(place_output_path), place_codebook)
+        print(f"Saved pick codebook shape={pick_codebook.shape} to {pick_output_path}")
+        print(f"Saved place codebook shape={place_codebook.shape} to {place_output_path}")
+    else:
+        codebook = np.zeros((action_dim, codebook_size), dtype=np.float32)
+        for d in range(action_dim):
+            codebook[d] = _run_1d_kmeans(
+                all_actions_arr[:, d],
+                k=codebook_size,
+                max_iters=max_iters,
+                rng=rng,
+            )
+        output_path = output_dir / "codebook.npy"
+        np.save(str(output_path), codebook)
+        print(f"Saved codebook shape={codebook.shape} to {output_path}")
+
+        for d in range(min(action_dim, 6)):
+            print(
+                f"  dim {d}: center_min={codebook[d, 0]:.6f} "
+                f"center_max={codebook[d, -1]:.6f}"
+            )
 
 
 if __name__ == "__main__":
