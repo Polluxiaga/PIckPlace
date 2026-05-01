@@ -135,6 +135,7 @@ class Pi0FASTConfig(_model.BaseModelConfig):
 class Pi0FAST(_model.BaseModel):
     def __init__(self, config: Pi0FASTConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+        self.config = config
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
@@ -231,7 +232,8 @@ class Pi0FAST(_model.BaseModel):
         assert observation.token_loss_mask is not None, "Token loss mask is required"
         loss_mask = observation.token_loss_mask[:, 1:]
         token_pplx = jnp.sum(targets * logp, axis=-1)
-        return -jnp.sum(token_pplx * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, -1), 1)
+        ce_loss = -jnp.sum(token_pplx * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, -1), 1)
+        return ce_loss
 
     @at.typecheck
     def compute_loss_per_token(
@@ -397,7 +399,8 @@ class Pi0FAST(_model.BaseModel):
         _, all_nll = jax.lax.scan(_scan_body, init_carry, scan_xs)
         # all_nll: [A, B]
 
-        return jnp.mean(all_nll, axis=0)                    # [B]
+        ce_loss = jnp.mean(all_nll, axis=0)                    # [B]
+        return ce_loss
 
     @override
     def sample_actions(

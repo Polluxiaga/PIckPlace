@@ -778,6 +778,196 @@ class PhaseVQActionTokenizer(FASTTokenizer):
         return out
 
 
+class PhaseVQVAEActionTokenizer(FASTTokenizer):
+    """Pick/place phase VQ-VAE tokenizer.
+
+    This keeps the successful two-token phase contract from
+    :class:`PhaseVQActionTokenizer`, but each 9-D phase is encoded and decoded by a
+    trained VQ-VAE instead of a raw k-means center.
+    """
+
+    def __init__(
+        self,
+        max_len: int = 256,
+        *,
+        pick_dim: int = 9,
+        place_dim: int = 9,
+        codebook_size: int = 128,
+        pick_vq_params_path: str,
+        place_vq_params_path: str,
+        oracle_encode: bool = False,
+        fast_skip_tokens: int = 128,
+    ):
+        from openpi.models.action_vq import JointVQVAEInfer
+
+        self._max_len = max_len
+        self.pick_dim = pick_dim
+        self.place_dim = place_dim
+        self.dof_dim = pick_dim + place_dim
+        self._n_bins = codebook_size
+        self._codebook_size = codebook_size
+        self._fast_skip_tokens = fast_skip_tokens
+        self._oracle_encode = bool(oracle_encode)
+
+        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        with path.open("rb") as f:
+            self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+        self._pick_vq = JointVQVAEInfer(pick_vq_params_path)
+        self._place_vq = JointVQVAEInfer(place_vq_params_path)
+        if self._pick_vq.action_dim != pick_dim:
+            raise ValueError(f"pick VQ action_dim mismatch: expected {pick_dim}, got {self._pick_vq.action_dim}")
+        if self._place_vq.action_dim != place_dim:
+            raise ValueError(f"place VQ action_dim mismatch: expected {place_dim}, got {self._place_vq.action_dim}")
+        if self._pick_vq.codebook_size != codebook_size:
+            raise ValueError(
+                f"pick VQ codebook_size mismatch: expected {codebook_size}, got {self._pick_vq.codebook_size}"
+            )
+        if self._place_vq.codebook_size != codebook_size:
+            raise ValueError(
+                f"place VQ codebook_size mismatch: expected {codebook_size}, got {self._place_vq.codebook_size}"
+            )
+        self._vq_params_paths = {
+            "pick_vq_params.npz": pick_vq_params_path,
+            "place_vq_params.npz": place_vq_params_path,
+        }
+        self._pick_decoded_codebook = self._pick_vq.decode_from_code(np.arange(codebook_size, dtype=np.int64))
+        self._place_decoded_codebook = self._place_vq.decode_from_code(np.arange(codebook_size, dtype=np.int64))
+        logging.info(
+            "PhaseVQVAEActionTokenizer: loaded pick VQ %s and place VQ %s, oracle_encode=%s",
+            pick_vq_params_path,
+            place_vq_params_path,
+            self._oracle_encode,
+        )
+
+    def _codes_to_paligemma_ids(self, codes: np.ndarray) -> np.ndarray:
+        v = self._paligemma_tokenizer.vocab_size()
+        return v - 1 - self._fast_skip_tokens - codes
+
+    def _paligemma_ids_to_codes(self, token_ids: np.ndarray | list[int]) -> np.ndarray:
+        t = np.asarray(token_ids, dtype=np.int64)
+        v = self._paligemma_tokenizer.vocab_size()
+        return v - 1 - self._fast_skip_tokens - t
+
+    def _bins_to_paligemma_ids(self, bins: np.ndarray) -> np.ndarray:
+        return self._codes_to_paligemma_ids(bins)
+
+    def _paligemma_ids_to_bins(self, token_ids: np.ndarray | list[int]) -> np.ndarray:
+        return self._paligemma_ids_to_codes(token_ids)
+
+    def _nearest_decoded_codes(self, vectors: np.ndarray, decoded_codebook: np.ndarray) -> np.ndarray:
+        vectors = np.asarray(vectors, dtype=np.float32)
+        orig_shape = vectors.shape[:-1]
+        flat = vectors.reshape(-1, vectors.shape[-1])
+        diff = flat[:, None, :] - decoded_codebook[None, :, :]
+        codes = np.argmin(np.sum(diff * diff, axis=-1), axis=-1).astype(np.int64)
+        return codes.reshape(orig_shape)
+
+    def _phase_codes(self, actions: np.ndarray, *, oracle: bool) -> tuple[np.ndarray, np.ndarray]:
+        if oracle:
+            pick_codes = self._nearest_decoded_codes(
+                actions[..., : self.pick_dim],
+                self._pick_decoded_codebook,
+            )
+            place_codes = self._nearest_decoded_codes(
+                actions[..., self.pick_dim : self.dof_dim],
+                self._place_decoded_codebook,
+            )
+        else:
+            pick_codes = np.asarray(self._pick_vq.encode_to_code(actions[..., : self.pick_dim]), dtype=np.int64)
+            place_codes = np.asarray(
+                self._place_vq.encode_to_code(actions[..., self.pick_dim : self.dof_dim]), dtype=np.int64
+            )
+        return pick_codes, place_codes
+
+    def oracle_actions(self, actions: np.ndarray) -> np.ndarray:
+        actions = np.asarray(actions, dtype=np.float32)
+        if actions.shape[-1] != self.dof_dim:
+            raise ValueError(f"actions last dim must be pick_dim+place_dim={self.dof_dim}, got {actions.shape[-1]}")
+        pick_codes, place_codes = self._phase_codes(actions, oracle=True)
+        pick = self._pick_vq.decode_from_code(pick_codes)
+        place = self._place_vq.decode_from_code(place_codes)
+        return np.concatenate([pick, place], axis=-1).astype(np.float32)
+
+    def tokenize(
+        self, prompt: str, state: np.ndarray, actions: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        cleaned_text = prompt.lower().strip().replace("_", " ")
+        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        state_str = " ".join(map(str, discretized_state))
+        prefix = f"Task: {cleaned_text}, State: {state_str};\n"
+        prefix_tokens = self._paligemma_tokenizer.encode(prefix, add_bos=True)
+
+        action_prefix_tokens = self._paligemma_tokenizer.encode("Action: ")
+        if actions is not None:
+            a = np.asarray(actions, dtype=np.float32)
+            if a.ndim == 1:
+                a = a[np.newaxis, :]
+            if a.shape[-1] != self.dof_dim:
+                raise ValueError(
+                    f"actions last dim must be pick_dim+place_dim={self.dof_dim}, got {a.shape[-1]}"
+                )
+            pick_codes, place_codes = self._phase_codes(a, oracle=self._oracle_encode)
+            codes = np.stack([pick_codes, place_codes], axis=-1).reshape(-1)
+            pg_ids = self._codes_to_paligemma_ids(codes)
+            action_content_tokens = pg_ids.astype(int).tolist() + self._paligemma_tokenizer.encode("|", add_eos=True)
+            postfix_tokens = action_prefix_tokens + action_content_tokens
+        else:
+            action_content_tokens = []
+            postfix_tokens = action_prefix_tokens
+
+        tokens = prefix_tokens + postfix_tokens
+        token_mask = [True] * len(tokens)
+        ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
+        loss_mask = (
+            [False] * len(prefix_tokens)
+            + [False] * len(action_prefix_tokens)
+            + [True] * len(action_content_tokens)
+        )
+
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            padding = [False] * (self._max_len - tokens_len)
+            tokens = tokens + padding
+            token_mask = token_mask + padding
+            ar_mask = ar_mask + padding
+            loss_mask = loss_mask + padding
+        else:
+            if len(tokens) > self._max_len:
+                logging.warning(f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating.")
+            tokens = tokens[: self._max_len]
+            token_mask = token_mask[: self._max_len]
+            ar_mask = ar_mask[: self._max_len]
+            loss_mask = loss_mask[: self._max_len]
+
+        return np.asarray(tokens), np.asarray(token_mask), np.asarray(ar_mask), np.asarray(loss_mask)
+
+    def extract_actions(self, tokens: np.ndarray, action_horizon: int, action_dim: int) -> np.ndarray:
+        if action_dim != 2:
+            logging.warning(
+                "PhaseVQVAEActionTokenizer expects FAST action_dim=2 code tokens, got %s",
+                action_dim,
+            )
+        all_codes = self._paligemma_ids_to_codes(tokens[: action_horizon * 2])
+        out = np.zeros((action_horizon, self.dof_dim), dtype=np.float32)
+        for h in range(action_horizon):
+            pick_pos = 2 * h
+            place_pos = pick_pos + 1
+            if pick_pos < len(all_codes):
+                pick_code = int(all_codes[pick_pos])
+                if 0 <= pick_code < 1024:
+                    out[h, : self.pick_dim] = self._pick_vq.decode_from_code(
+                        np.array([np.clip(pick_code, 0, self._codebook_size - 1)])
+                    )[0]
+            if place_pos < len(all_codes):
+                place_code = int(all_codes[place_pos])
+                if 0 <= place_code < 1024:
+                    out[h, self.pick_dim : self.dof_dim] = self._place_vq.decode_from_code(
+                        np.array([np.clip(place_code, 0, self._codebook_size - 1)])
+                    )[0]
+        return out
+
+
 class VQVAEActionTokenizer(FASTTokenizer):
     """Joint VQ-VAE action tokenizer: each 18-D action uses **one** code token.
 

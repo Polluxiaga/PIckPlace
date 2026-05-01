@@ -125,7 +125,16 @@ def save_state(
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy(str(vq_params_path), str(dst))
                     logging.info("Saved vq_params to %s", dst)
-                if bin_edges is not None or codebook is not None or vq_params_path is not None:
+                vq_params_paths = getattr(tok_obj, "_vq_params_paths", None)
+                if vq_params_paths is not None:
+                    import shutil
+                    for filename, src in vq_params_paths.items():
+                        if src is not None and epath.Path(src).exists():
+                            dst = epath.Path(directory / data_config.asset_id / filename)
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy(str(src), str(dst))
+                            logging.info("Saved %s to %s", filename, dst)
+                if bin_edges is not None or codebook is not None or vq_params_path is not None or vq_params_paths is not None:
                     break
 
     # Split params that can be used for inference into a separate item.

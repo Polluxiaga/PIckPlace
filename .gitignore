@@ -54,6 +54,8 @@ openpi_pickplace/data/
 **/*.swp
 **/*~
 tmp/
+logs/
 
 # Safety: if old nested repos are backed up in-tree, ignore them
 **/.git.backup/
+openpi_pickplace/assets/

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import dataclasses
 import functools
 import json
@@ -43,21 +42,11 @@ FRONT_CAMERA_INTRINSICS = np.array(
 
 def _write_local_sweep_metrics(
     metrics_path: epath.Path,
-    latest_metrics_path: epath.Path,
-    csv_path: epath.Path,
     *,
     payload: dict[str, Any],
 ) -> None:
     with metrics_path.open("a") as f:
         f.write(json.dumps(payload, sort_keys=True) + "\n")
-    latest_metrics_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-
-    file_exists = csv_path.exists()
-    with csv_path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(payload.keys()))
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(payload)
 
 
 def _loss_token_labels(action_dim: int, action_horizon: int) -> list[str]:
@@ -75,6 +64,102 @@ def _loss_token_labels(action_dim: int, action_horizon: int) -> list[str]:
             labels.append(f"h{horizon:02d}_action_{dim:02d}")
     labels.extend(["pipe", "eos"])
     return labels
+
+
+PICK_PLACE_ALL_SCENE_COUNTS: tuple[tuple[str, int], ...] = (
+    ("close_jar", 25),
+    ("insert_onto_square_peg", 25),
+    ("light_bulb_in", 25),
+    ("meat_off_grill", 25),
+    ("place_cups", 25),
+    ("place_shape_in_shape_sorter", 24),
+    ("place_wine_at_rack_location", 25),
+    ("put_groceries_in_cupboard", 23),
+    ("put_item_in_drawer", 25),
+    ("put_money_in_safe", 25),
+    ("stack_blocks", 25),
+    ("stack_cups", 25),
+)
+
+
+def scene_name_for_pick_place_all_index(index: int) -> str:
+    cursor = 0
+    for scene, count in PICK_PLACE_ALL_SCENE_COUNTS:
+        if cursor <= index < cursor + count:
+            return scene
+        cursor += count
+    return "unknown"
+
+
+def _scene_name_for_eval_index(eval_repo_id: str, index: int) -> str:
+    if eval_repo_id.endswith("pick_place_all_test") or eval_repo_id.endswith("pick_place_all"):
+        return scene_name_for_pick_place_all_index(index)
+    return "unknown"
+
+
+def _metric_means(rows: list[dict[str, Any]]) -> dict[str, float]:
+    metric_keys = (
+        "action_mse",
+        "pick_action_mse",
+        "place_action_mse",
+        "pick_rot6d_l2",
+        "place_rot6d_l2",
+        "pick_trans_l2",
+        "place_trans_l2",
+    )
+    return {
+        key: float(np.mean([float(row[key]) for row in rows]))
+        for key in metric_keys
+        if rows and key in rows[0]
+    }
+
+
+def build_scene_metric_rows(
+    case_rows: list[dict[str, Any]],
+    *,
+    eval_repo_id: str,
+    step: int | None = None,
+    metric_prefix: str = "test",
+) -> list[dict[str, Any]]:
+    def key(name: str) -> str:
+        return f"{metric_prefix}/{name}" if metric_prefix else name
+
+    by_scene: dict[str, list[dict[str, Any]]] = {}
+    for row in case_rows:
+        scene = str(row.get("scene") or _scene_name_for_eval_index(eval_repo_id, int(row["case_index"])))
+        by_scene.setdefault(scene, []).append(row)
+
+    out: list[dict[str, Any]] = []
+    for scene, rows in by_scene.items():
+        payload: dict[str, Any] = {
+            "eval_repo_id": eval_repo_id,
+            "scene": scene,
+            key("num_examples_used"): float(len(rows)),
+        }
+        if step is not None:
+            payload["step"] = int(step)
+            payload[key("checkpoint_step")] = float(step)
+        payload.update({key(metric_name): value for metric_name, value in _metric_means(rows).items()})
+        out.append(payload)
+
+    all_payload: dict[str, Any] = {
+        "eval_repo_id": eval_repo_id,
+        "scene": "__ALL__",
+        key("num_examples_used"): float(len(case_rows)),
+    }
+    if step is not None:
+        all_payload["step"] = int(step)
+        all_payload[key("checkpoint_step")] = float(step)
+    all_payload.update({key(metric_name): value for metric_name, value in _metric_means(case_rows).items()})
+    out.append(all_payload)
+    return out
+
+
+def write_jsonl(path: epath.Path, rows: list[dict[str, Any]], *, append: bool = False) -> None:
+    mode = "a" if append else "w"
+    with path.open(mode) as f:
+        for row in rows:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
 
 
 def _token_ce_metrics(prefix: str, ce_by_loss_pos: np.ndarray, *, action_dim: int, action_horizon: int) -> dict[str, float]:
@@ -186,10 +271,7 @@ def _save_token_ce_chart(
 
     from matplotlib.lines import Line2D
 
-    dof_handles = [
-        Line2D([0], [0], color=colors[i], lw=2, label=f"dof_{i:02d}")
-        for i in range(9)
-    ]
+    dof_handles = [Line2D([0], [0], color=colors[i], lw=2, label=f"dof_{i:02d}") for i in range(9)]
     stage_handles = [
         Line2D([0], [0], color="black", lw=2, linestyle="-", label="pick"),
         Line2D([0], [0], color="black", lw=2, linestyle="--", label="place"),
@@ -224,6 +306,8 @@ def _fast_tokenizer_from_config(
         ("bin_edges_path", "bin_edges.npy"),
         ("codebook_path", "codebook.npy"),
         ("vq_params_path", "vq_params.npz"),
+        ("pick_vq_params_path", "pick_vq_params.npz"),
+        ("place_vq_params_path", "place_vq_params.npz"),
     ):
         if key in kwargs and not epath.Path(kwargs[key]).exists():
             if checkpoint_assets_dir and asset_id:
@@ -453,6 +537,13 @@ def _save_overlay_grid(
     return overlay_path
 
 
+def _oracle_actions_from_tokenizer(tokenizer: Any, actions: np.ndarray) -> np.ndarray:
+    oracle_actions = getattr(tokenizer, "oracle_actions", None)
+    if oracle_actions is None:
+        raise ValueError("oracle_action_eval requires a tokenizer with an oracle_actions(actions) method.")
+    return np.asarray(oracle_actions(actions), dtype=np.float32)
+
+
 def list_checkpoint_steps(checkpoint_root: epath.Path) -> list[int]:
     steps = []
     for child in checkpoint_root.iterdir():
@@ -517,6 +608,7 @@ def evaluate_checkpoint(
     local_batch_size = batch_size // jax.process_count()
     if local_batch_size <= 0:
         raise ValueError(f"Invalid batch size {batch_size} for process_count={jax.process_count()}.")
+    local_batch_size = _largest_divisor_at_most(n, local_batch_size)
 
     num_batches = n // local_batch_size
     if num_batches == 0:
@@ -565,6 +657,7 @@ def evaluate_checkpoint(
         max_decoding_steps = max_loss_tokens
     total_token_ce_sums = np.zeros(max_loss_tokens, dtype=np.float64)
     total_token_ce_counts = np.zeros(max_loss_tokens, dtype=np.float64)
+    case_rows: list[dict[str, Any]] = []
     media: dict[str, Any] = {}
     media_written = False
 
@@ -588,15 +681,22 @@ def evaluate_checkpoint(
         total_token_ce_sums += token_ce_sums
         total_token_ce_counts += token_ce_counts
 
-        batch_inf = _tokenize_collated_batch(batch_pre, tokenize, include_actions=False)
-        obs_inf = _model.Observation.from_dict(batch_inf)
-        rng, sample_rng = jax.random.split(rng)
-        token_ids = model.sample_actions(sample_rng, obs_inf, max_decoding_steps=max_decoding_steps)
-        token_np = np.asarray(jax.device_get(token_ids)).astype(np.int32)
-
-        pred_chunks = [extract({"actions": token_np[i]})["actions"] for i in range(token_np.shape[0])]
-        pred_actions_norm = np.stack(pred_chunks, axis=0)
         gt_actions_norm = np.asarray(batch_pre["actions"])
+        if config.oracle_action_eval:
+            pred_actions_norm = _oracle_actions_from_tokenizer(tok, gt_actions_norm)
+        else:
+            batch_inf = _tokenize_collated_batch(batch_pre, tokenize, include_actions=False)
+            obs_inf = _model.Observation.from_dict(batch_inf)
+            rng, sample_rng = jax.random.split(rng)
+            sampled_actions = model.sample_actions(
+                sample_rng,
+                obs_inf,
+                max_decoding_steps=max_decoding_steps,
+            )
+            sampled_np = np.asarray(jax.device_get(sampled_actions))
+            token_np = sampled_np.astype(np.int32)
+            pred_chunks = [extract({"actions": token_np[i]})["actions"] for i in range(token_np.shape[0])]
+            pred_actions_norm = np.stack(pred_chunks, axis=0)
 
         pred_actions_raw = _unnormalize_actions(
             pred_actions_norm,
@@ -621,6 +721,7 @@ def evaluate_checkpoint(
         place_action_mse = np.mean((pred_flat[:, 9:18] - gt_flat[:, 9:18]) ** 2, axis=-1)
 
         batch_examples = int(pred_flat.shape[0])
+        start_index = total_examples
         total_examples += batch_examples
         total_ce_sum += float(np.sum(per_example_ce))
         total_action_mse_sum += float(np.sum(action_mse))
@@ -630,7 +731,21 @@ def evaluate_checkpoint(
         total_place_rot6d_l2_sum += float(np.sum(place_rot6d_err))
         total_pick_trans_l2_sum += float(np.sum(pick_trans_err))
         total_place_trans_l2_sum += float(np.sum(place_trans_err))
-
+        for i in range(batch_examples):
+            case_index = start_index + i
+            case_rows.append(
+                {
+                    "case_index": case_index,
+                    "scene": _scene_name_for_eval_index(eval_repo_id, case_index),
+                    "action_mse": float(action_mse[i]),
+                    "pick_action_mse": float(pick_action_mse[i]),
+                    "place_action_mse": float(place_action_mse[i]),
+                    "pick_rot6d_l2": float(pick_rot6d_err[i]),
+                    "place_rot6d_l2": float(place_rot6d_err[i]),
+                    "pick_trans_l2": float(pick_trans_err[i]),
+                    "place_trans_l2": float(place_trans_err[i]),
+                }
+            )
         if not media_written:
             checkpoint_step = int(checkpoint_dir.name)
             overlay_grid = _build_overlay_grid(batch_pre, gt_flat, pred_flat)
@@ -679,6 +794,8 @@ def evaluate_checkpoint(
     )
     if "token_ce/action_mean" in metrics:
         metrics["token_ce_avg"] = metrics["token_ce/action_mean"]
+    scene_rows = build_scene_metric_rows(case_rows, eval_repo_id=eval_repo_id, metric_prefix="")
+    write_jsonl(checkpoint_dir / "test_scene_metrics.jsonl", scene_rows)
     return metrics, media
 
 
@@ -699,25 +816,35 @@ def _eval_max_decoding_steps(config: _config.TrainConfig) -> int:
     return int(os.environ.get("EVAL_MAX_DECODING_STEPS", str(default)))
 
 
-def _sweep_paths(checkpoint_root: epath.Path, metric_prefix: str) -> tuple[epath.Path, epath.Path, epath.Path]:
+def _largest_divisor_at_most(n: int, limit: int) -> int:
+    for value in range(min(n, limit), 0, -1):
+        if n % value == 0:
+            return value
+    return 1
+
+
+def _sweep_paths(checkpoint_root: epath.Path, metric_prefix: str) -> tuple[epath.Path, epath.Path]:
     return (
         checkpoint_root / f"{metric_prefix}_sweep.jsonl",
-        checkpoint_root / f"{metric_prefix}_sweep.latest.json",
-        checkpoint_root / f"{metric_prefix}_sweep.csv",
+        checkpoint_root / f"{metric_prefix}_scene_sweep.jsonl",
     )
 
 
 def reset_eval_sweep_files(config: _config.TrainConfig) -> None:
     _, metric_prefix, _, _ = _eval_runtime_options(config)
-    metrics_path, latest_metrics_path, csv_path = _sweep_paths(config.checkpoint_dir, metric_prefix)
-    for path in (metrics_path, latest_metrics_path, csv_path):
+    metrics_path, scene_metrics_path = _sweep_paths(config.checkpoint_dir, metric_prefix)
+    legacy_paths = (
+        config.checkpoint_dir / f"{metric_prefix}_sweep.latest.json",
+        config.checkpoint_dir / f"{metric_prefix}_sweep.csv",
+    )
+    for path in (metrics_path, scene_metrics_path, *legacy_paths):
         if path.exists():
             path.unlink()
 
 
 def load_eval_token_ce_history(config: _config.TrainConfig) -> dict[int, dict[str, float]]:
     _, metric_prefix, _, _ = _eval_runtime_options(config)
-    metrics_path, _, _ = _sweep_paths(config.checkpoint_dir, metric_prefix)
+    metrics_path, _ = _sweep_paths(config.checkpoint_dir, metric_prefix)
     history: dict[int, dict[str, float]] = {}
     if not metrics_path.exists():
         return history
@@ -766,7 +893,7 @@ def evaluate_and_log_checkpoint(
         logging.warning("Checkpoint eval skipped: %s does not exist", checkpoint_dir)
         return None
 
-    metrics_path, latest_metrics_path, csv_path = _sweep_paths(checkpoint_root, metric_prefix)
+    metrics_path, scene_metrics_path = _sweep_paths(checkpoint_root, metric_prefix)
     checkpoint_step_key = _define_eval_wandb_metrics(metric_prefix)
 
     logging.info(
@@ -790,7 +917,31 @@ def evaluate_and_log_checkpoint(
         checkpoint_step_key: float(step),
         **{f"{metric_prefix}/{k}": float(v) for k, v in metrics.items()},
     }
-    _write_local_sweep_metrics(metrics_path, latest_metrics_path, csv_path, payload=payload)
+    _write_local_sweep_metrics(metrics_path, payload=payload)
+    scene_rows = []
+    scene_metrics_path_for_checkpoint = checkpoint_dir / "test_scene_metrics.jsonl"
+    if scene_metrics_path_for_checkpoint.exists():
+        with scene_metrics_path_for_checkpoint.open() as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("scene") == "__ALL__":
+                    continue
+                scene_payload = {
+                    "eval_repo_id": eval_repo_id,
+                    "step": step,
+                    checkpoint_step_key: float(step),
+                    **{
+                        f"{metric_prefix}/{key}": float(value)
+                        for key, value in row.items()
+                        if isinstance(value, (int, float)) and key not in {"step"}
+                    },
+                    "scene": row["scene"],
+                }
+                scene_rows.append(scene_payload)
+    if scene_rows:
+        write_jsonl(scene_metrics_path, scene_rows, append=True)
 
     if token_ce_history is None:
         token_ce_history = {}
@@ -805,7 +956,6 @@ def evaluate_and_log_checkpoint(
             str(token_ce_chart),
             caption=f"checkpoint_step={step}; pick=solid, place=dashed",
         )
-
     wandb_payload = _eval_wandb_payload(
         payload,
         prefix=metric_prefix,

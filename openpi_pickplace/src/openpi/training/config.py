@@ -146,6 +146,13 @@ class ModelTransformFactory(GroupFactory):
                 tokenizer_kwargs = (
                     {} if model_config.fast_model_tokenizer_kwargs is None else model_config.fast_model_tokenizer_kwargs
                 )
+                output_transforms = [
+                    _transforms.ExtractFASTActions(
+                        tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
+                        action_horizon=model_config.action_horizon,
+                        action_dim=model_config.action_dim,
+                    )
+                ]
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -154,13 +161,7 @@ class ModelTransformFactory(GroupFactory):
                             tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
                         ),
                     ],
-                    outputs=[
-                        _transforms.ExtractFASTActions(
-                            tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
-                            action_horizon=model_config.action_horizon,
-                            action_dim=model_config.action_dim,
-                        )
-                    ],
+                    outputs=output_transforms,
                 )
 
 
@@ -580,6 +581,9 @@ class TrainConfig:
     best_checkpoint_metric: str = "action_mse"
     # Whether smaller or larger values are better for best_checkpoint_metric.
     best_checkpoint_mode: Literal["min", "max"] = "min"
+    # If true, action metrics use GT actions passed through the tokenizer's oracle
+    # encode/decode path instead of sampled model tokens. CE still uses the model.
+    oracle_action_eval: bool = False
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -769,6 +773,58 @@ def _pickplace_all_phase_vq_config(name: str) -> TrainConfig:
         num_train_steps=30_000,
         freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
         ema_decay=None,
+    )
+
+
+def _pickplace_all_phase_vqvae_config(
+    name: str,
+    *,
+    codebook_size: int = 128,
+    num_train_steps: int = 30_000,
+    oracle: bool = False,
+    oracle_action_eval: bool | None = None,
+    vq_asset_name: str | None = None,
+) -> TrainConfig:
+    if oracle_action_eval is None:
+        oracle_action_eval = oracle
+    vq_asset_name = vq_asset_name or name
+    tokenizer_kwargs = {
+        "pick_dim": 9,
+        "place_dim": 9,
+        "codebook_size": codebook_size,
+        "pick_vq_params_path": f"assets/{vq_asset_name}/pick_place_all/pick_vq_params.npz",
+        "place_vq_params_path": f"assets/{vq_asset_name}/pick_place_all/place_vq_params.npz",
+        "oracle_encode": oracle,
+    }
+    return TrainConfig(
+        name=name,
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=2,
+            action_horizon=1,
+            max_token_len=512,
+            paligemma_variant="gemma_2b_lora",
+            fast_model_tokenizer=_tokenizer.PhaseVQVAEActionTokenizer,
+            fast_model_tokenizer_kwargs=tokenizer_kwargs,
+        ),
+        data=LeRobotRLBenchPickPlaceDataConfig(
+            repo_id="minyangli/pick_place_all",
+            # Reuse the same normalized stats as qbin/vq/phase-vq.
+            assets=AssetsConfig(assets_dir="assets/pickplace_all_qbin64", asset_id="pick_place_all"),
+            num_ctx_frames=1,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=200,
+            peak_lr=1e-5,
+            decay_steps=2_500,
+            decay_lr=1e-6,
+        ),
+        num_train_steps=num_train_steps,
+        freeze_filter=pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(),
+        ema_decay=None,
+        oracle_action_eval=oracle_action_eval,
+        best_checkpoint_metric="token_ce_avg" if oracle_action_eval else "action_mse",
     )
 
 
@@ -963,6 +1019,21 @@ _CONFIGS = [
     _pickplace_all_uniform_config("pickplace_all_uniform"),
     _pickplace_all_vq_config("pickplace_all_vq64"),
     _pickplace_all_phase_vq_config("pickplace_all_phase_vq64"),
+    _pickplace_all_phase_vqvae_config("pickplace_all_phase_vqvae128"),
+    _pickplace_all_phase_vqvae_config(
+        "pickplace_all_phase_vqvae64",
+        codebook_size=64,
+        num_train_steps=10_000,
+        oracle=True,
+    ),
+    _pickplace_all_phase_vqvae_config(
+        "pickplace_all_phase_vqvae64_oracle_policy",
+        codebook_size=64,
+        num_train_steps=10_000,
+        oracle=True,
+        oracle_action_eval=False,
+        vq_asset_name="pickplace_all_phase_vqvae64",
+    ),
 
     #####################################################################################################
     TrainConfig(
